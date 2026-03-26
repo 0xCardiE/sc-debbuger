@@ -44,6 +44,10 @@ interface Transaction {
   errorDecodeStatus?: string;
   errorProbeSource?: string;
   errorDebugRaw?: string;
+  sourceLocationStatus?: string;
+  sourceLocationMatches?: string[];
+  traceStatus?: string;
+  traceSummary?: string[];
 }
 
 interface EtherscanTransaction {
@@ -75,6 +79,27 @@ interface StoredData {
   };
 }
 
+interface VerifiedSourceFile {
+  path: string;
+  content: string;
+}
+
+interface VerifiedSourceBundle {
+  contractName: string;
+  files: VerifiedSourceFile[];
+}
+
+interface TraceCallFrame {
+  type?: string;
+  from?: string;
+  to?: string;
+  input?: string;
+  output?: string;
+  error?: string;
+  revertReason?: string;
+  calls?: TraceCallFrame[];
+}
+
 const getStorageKey = (
   chainId: string,
   contractId: string,
@@ -82,11 +107,42 @@ const getStorageKey = (
 ) => `${chainId}_${contractId}_${type}`;
 
 const HEX_PATTERN = /0x[a-fA-F0-9]{8,}/g;
+const ADDRESS_HEX_LENGTH = 42;
+const SELECTOR_HEX_LENGTH = 10;
+const REVERT_DATA_FIELD_NAMES = new Set([
+  'data',
+  'errordata',
+  'revertdata',
+  'result',
+  'output',
+  'returndata',
+  'payload',
+  'body'
+]);
 
-const collectHexStrings = (value: unknown, acc: string[], seen = new WeakSet<object>()) => {
+const normalizeHexCandidate = (value: string): string | null => {
+  const normalized = value.toLowerCase();
+  if (!normalized.startsWith('0x')) return null;
+  if (!/^0x[a-f0-9]+$/.test(normalized)) return null;
+  return normalized;
+};
+
+const isLikelyAddress = (value: string): boolean => value.length === ADDRESS_HEX_LENGTH;
+
+const collectHexStrings = (
+  value: unknown,
+  acc: Array<{ value: string; path: string }>,
+  path = 'root',
+  seen = new WeakSet<object>()
+) => {
   if (typeof value === 'string') {
     const matches = value.match(HEX_PATTERN);
-    if (matches) acc.push(...matches);
+    if (matches) {
+      matches.forEach((match) => {
+        const normalized = normalizeHexCandidate(match);
+        if (normalized) acc.push({ value: normalized, path });
+      });
+    }
     return;
   }
 
@@ -95,29 +151,54 @@ const collectHexStrings = (value: unknown, acc: string[], seen = new WeakSet<obj
   seen.add(value);
 
   if (Array.isArray(value)) {
-    value.forEach((item) => collectHexStrings(item, acc, seen));
+    value.forEach((item, index) => collectHexStrings(item, acc, `${path}[${index}]`, seen));
     return;
   }
 
-  Object.values(value).forEach((item) => collectHexStrings(item, acc, seen));
+  Object.entries(value).forEach(([key, item]) => {
+    collectHexStrings(item, acc, `${path}.${key.toLowerCase()}`, seen);
+  });
+};
+
+const scoreHexCandidate = (candidate: { value: string; path: string }): number => {
+  let score = 0;
+  const pathParts = candidate.path.split('.');
+
+  if (candidate.value.length > ADDRESS_HEX_LENGTH) score += 20;
+  if (candidate.value.length === SELECTOR_HEX_LENGTH) score += 5;
+  if (isLikelyAddress(candidate.value)) score -= 30;
+
+  if (pathParts.some((part) => REVERT_DATA_FIELD_NAMES.has(part))) score += 50;
+  if (candidate.path.includes('error')) score += 15;
+  if (candidate.path.includes('message')) score -= 10;
+
+  return score;
 };
 
 const extractHexCandidates = (error: unknown): string[] => {
-  const candidates: string[] = [];
+  const candidates: Array<{ value: string; path: string }> = [];
   collectHexStrings(error, candidates);
-  return [...new Set(candidates.map((candidate) => candidate.toLowerCase()))];
+
+  return [...new Map(
+    candidates
+      .sort((left, right) => scoreHexCandidate(right) - scoreHexCandidate(left))
+      .map((candidate) => [candidate.value, candidate.value])
+  ).values()];
 };
 
 const extractErrorData = (error: unknown): string | null => {
   const candidates = extractHexCandidates(error);
-  return candidates.find((candidate) => candidate.length > 10) || null;
+  return candidates.find(
+    (candidate) => candidate.length > SELECTOR_HEX_LENGTH && !isLikelyAddress(candidate)
+  ) || null;
 };
 
 const extractErrorSelector = (error: unknown): string | null => {
   const candidates = extractHexCandidates(error);
   return candidates
-    .map((candidate) => candidate.slice(0, 10))
-    .find((candidate) => candidate.length === 10) || null;
+    .filter((candidate) => !isLikelyAddress(candidate))
+    .map((candidate) => candidate.slice(0, SELECTOR_HEX_LENGTH))
+    .find((candidate) => candidate.length === SELECTOR_HEX_LENGTH) || null;
 };
 
 const getErrorText = (error: unknown): string => {
@@ -133,6 +214,41 @@ const getErrorText = (error: unknown): string => {
     .filter((value): value is string => typeof value === 'string' && value.length > 0)
     .join(' | ')
     .toLowerCase();
+};
+
+const isTraceFrameFailing = (frame: TraceCallFrame | null | undefined): boolean => {
+  if (!frame) return false;
+  return Boolean(frame.error || frame.revertReason || (frame.output && frame.output !== '0x'));
+};
+
+const findDeepestFailingTraceFrame = (frame: TraceCallFrame | null | undefined): TraceCallFrame | null => {
+  if (!frame) return null;
+
+  for (const child of frame.calls || []) {
+    const failingChild = findDeepestFailingTraceFrame(child);
+    if (failingChild) return failingChild;
+  }
+
+  return isTraceFrameFailing(frame) ? frame : null;
+};
+
+const buildTraceSummary = (frame: TraceCallFrame | null | undefined): string[] => {
+  if (!frame) return [];
+
+  const summary: string[] = [];
+  let current: TraceCallFrame | undefined | null = frame;
+
+  while (current) {
+    const parts = [
+      current.type || 'CALL',
+      current.to || 'unknown-target',
+      current.revertReason || current.error || ''
+    ].filter(Boolean);
+    summary.push(parts.join(' - '));
+    current = current.calls && current.calls.length > 0 ? current.calls[0] : null;
+  }
+
+  return summary.slice(0, 5);
 };
 
 const safeStringifyError = (error: unknown): string => {
@@ -154,6 +270,25 @@ const safeStringifyError = (error: unknown): string => {
   }
 };
 
+const summarizeTraceError = (error: unknown): string => {
+  const message = error instanceof Error ? error.message : String(error);
+  const lowerMessage = message.toLowerCase();
+
+  if (lowerMessage.includes('no state available for block')) {
+    return 'Trace unavailable: RPC lacks historical state for this block. Using fallback replay instead.';
+  }
+
+  if (lowerMessage.includes('method not found') || lowerMessage.includes('-32601')) {
+    return 'Trace unavailable: RPC does not support debug tracing. Using fallback replay instead.';
+  }
+
+  if (lowerMessage.includes('missing trie node')) {
+    return 'Trace unavailable: RPC is missing required archive state. Using fallback replay instead.';
+  }
+
+  return 'Trace unavailable: RPC could not provide a transaction trace. Using fallback replay instead.';
+};
+
 const hasUsefulRevertData = (error: unknown): boolean => {
   const errorData = extractErrorData(error);
   return Boolean(errorData && errorData.startsWith('0x') && errorData.length >= 10);
@@ -167,6 +302,273 @@ const needsErrorAnalysis = (tx: Transaction): boolean => {
   if (tx.errorName === 'CALL_EXCEPTION' && !tx.errorDataRaw) return true;
   if (!tx.errorSelector && tx.errorDataRaw) return true;
   return false;
+};
+
+const getErrorBaseName = (errorName?: string): string | null => {
+  if (!errorName) return null;
+  const match = errorName.match(/^([A-Za-z0-9_]+)/);
+  if (!match) return null;
+  const baseName = match[1];
+  if (baseName === 'Error' || baseName === 'Panic' || baseName === 'CALL_EXCEPTION') return null;
+  if (baseName.startsWith('0x')) return null;
+  return baseName;
+};
+
+const getMethodBaseName = (functionName?: string): string | null => {
+  if (!functionName || functionName === 'Unknown' || functionName === 'N/A') return null;
+  const match = functionName.match(/^([A-Za-z0-9_]+)/);
+  return match ? match[1] : null;
+};
+
+const parseVerifiedSourceCode = (
+  sourceCode: string,
+  contractName: string
+): VerifiedSourceBundle | null => {
+  if (!sourceCode.trim()) return null;
+
+  const normalized = sourceCode.trim();
+  const tryParseJson = (value: string) => {
+    try {
+      return JSON.parse(value) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  };
+
+  const parsedJson =
+    tryParseJson(normalized) ||
+    (normalized.startsWith('{{') && normalized.endsWith('}}')
+      ? tryParseJson(normalized.slice(1, -1))
+      : null);
+
+  if (parsedJson && parsedJson.sources && typeof parsedJson.sources === 'object') {
+    const files = Object.entries(parsedJson.sources as Record<string, unknown>)
+      .map(([path, sourceEntry]) => {
+        if (
+          sourceEntry &&
+          typeof sourceEntry === 'object' &&
+          'content' in sourceEntry &&
+          typeof sourceEntry.content === 'string'
+        ) {
+          return {
+            path,
+            content: sourceEntry.content
+          };
+        }
+        return null;
+      })
+      .filter((file): file is VerifiedSourceFile => file !== null);
+
+    if (files.length > 0) {
+      return {
+        contractName,
+        files
+      };
+    }
+  }
+
+  return {
+    contractName,
+    files: [
+      {
+        path: `${contractName || 'Contract'}.sol`,
+        content: sourceCode
+      }
+    ]
+  };
+};
+
+const extractFunctionBlocks = (
+  file: VerifiedSourceFile,
+  methodName: string
+): Array<{ path: string; startLine: number; endLine: number; content: string }> => {
+  const content = file.content;
+  const regex = new RegExp(`\\bfunction\\s+${methodName}\\s*\\(`, 'g');
+  const blocks: Array<{ path: string; startLine: number; endLine: number; content: string }> = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(content)) !== null) {
+    const startIndex = match.index;
+    const braceStart = content.indexOf('{', startIndex);
+    if (braceStart === -1) continue;
+
+    let depth = 0;
+    let endIndex = braceStart;
+    for (let i = braceStart; i < content.length; i += 1) {
+      if (content[i] === '{') depth += 1;
+      if (content[i] === '}') depth -= 1;
+      if (depth === 0) {
+        endIndex = i;
+        break;
+      }
+    }
+
+    const blockContent = content.slice(startIndex, endIndex + 1);
+    const startLine = content.slice(0, startIndex).split('\n').length;
+    const endLine = startLine + blockContent.split('\n').length - 1;
+
+    blocks.push({
+      path: file.path,
+      startLine,
+      endLine,
+      content: blockContent
+    });
+  }
+
+  return blocks;
+};
+
+const extractDeclaredErrors = (sourceBundle: VerifiedSourceBundle | null): Array<{
+  name: string;
+  signature: string;
+  selector: string;
+  declaration: string;
+  path: string;
+  line: number;
+}> => {
+  if (!sourceBundle) return [];
+
+  const declarations: Array<{
+    name: string;
+    signature: string;
+    selector: string;
+    declaration: string;
+    path: string;
+    line: number;
+  }> = [];
+
+  sourceBundle.files.forEach((file) => {
+    const lines = file.content.split('\n');
+    lines.forEach((line, index) => {
+      const match = line.match(/\berror\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)\s*;/);
+      if (!match) return;
+
+      const name = match[1];
+      const params = match[2]
+        .split(',')
+        .map((param) => param.trim())
+        .filter(Boolean)
+        .map((param) => param.split(/\s+/)[0]);
+      const signature = `${name}(${params.join(',')})`;
+
+      declarations.push({
+        name,
+        signature,
+        selector: ethers.id(signature).slice(0, 10).toLowerCase(),
+        declaration: line.trim(),
+        path: file.path,
+        line: index + 1
+      });
+    });
+  });
+
+  return declarations;
+};
+
+const findLikelySourceLocations = (
+  sourceBundle: VerifiedSourceBundle | null,
+  functionName?: string,
+  errorSelector?: string,
+  errorName?: string,
+  errorReason?: string
+): string[] => {
+  if (!sourceBundle) return [];
+
+  const methodBaseName = getMethodBaseName(functionName);
+  const errorBaseName = getErrorBaseName(errorName);
+  const reasonStringMatch = errorReason?.match(/^Error\((.*)\)$/);
+  const reasonString = reasonStringMatch?.[1] || '';
+  const normalizedSelector = errorSelector?.toLowerCase();
+  const declaredErrors = extractDeclaredErrors(sourceBundle);
+  const candidates: Array<{ label: string; score: number }> = [];
+
+  const addCandidate = (label: string, score: number) => {
+    candidates.push({ label, score });
+  };
+
+  if (methodBaseName) {
+    sourceBundle.files.forEach((file) => {
+      const blocks = extractFunctionBlocks(file, methodBaseName);
+
+      blocks.forEach((block) => {
+        const blockLines = block.content.split('\n');
+
+        blockLines.forEach((line, index) => {
+          const absoluteLine = block.startLine + index;
+          const trimmedLine = line.trim();
+
+          if (errorBaseName && new RegExp(`\\brevert\\s+${errorBaseName}\\s*\\(`).test(trimmedLine)) {
+            addCandidate(`${block.path}:${absoluteLine} - ${trimmedLine}`, 200);
+          }
+
+          if (reasonString && trimmedLine.includes(reasonString)) {
+            addCandidate(`${block.path}:${absoluteLine} - ${trimmedLine}`, 180);
+          }
+
+          const referencedErrorNames = Array.from(trimmedLine.matchAll(/\brevert\s+([A-Za-z0-9_]+)\s*\(/g))
+            .map((match) => match[1]);
+
+          referencedErrorNames.forEach((referencedErrorName) => {
+            const declaration = declaredErrors.find((item) => item.name === referencedErrorName);
+            if (!declaration) return;
+
+            if (normalizedSelector && declaration.selector === normalizedSelector) {
+              addCandidate(
+                `${block.path}:${absoluteLine} - ${trimmedLine} [selector match ${normalizedSelector}]`,
+                250
+              );
+            } else if (errorBaseName && declaration.name === errorBaseName) {
+              addCandidate(`${block.path}:${absoluteLine} - ${trimmedLine}`, 190);
+            }
+          });
+        });
+      });
+    });
+  }
+
+  declaredErrors.forEach((declaration) => {
+    if (normalizedSelector && declaration.selector === normalizedSelector) {
+      addCandidate(
+        `${declaration.path}:${declaration.line} - ${declaration.declaration} [error declaration ${declaration.selector}]`,
+        120
+      );
+    } else if (errorBaseName && declaration.name === errorBaseName) {
+      addCandidate(
+        `${declaration.path}:${declaration.line} - ${declaration.declaration}`,
+        60
+      );
+    }
+  });
+
+  sourceBundle.files.forEach((file) => {
+    const lines = file.content.split('\n');
+
+    lines.forEach((line, index) => {
+      const lineNumber = index + 1;
+      const trimmedLine = line.trim();
+
+      if (errorBaseName) {
+        if (new RegExp(`\\brevert\\s+${errorBaseName}\\s*\\(`).test(trimmedLine)) {
+          addCandidate(`${file.path}:${lineNumber} - ${trimmedLine}`, 100);
+          return;
+        }
+
+        if (new RegExp(`\\berror\\s+${errorBaseName}\\s*\\(`).test(trimmedLine)) {
+          addCandidate(`${file.path}:${lineNumber} - ${trimmedLine}`, 30);
+        }
+      }
+
+      if (reasonString && trimmedLine.includes(reasonString)) {
+        addCandidate(`${file.path}:${lineNumber} - ${trimmedLine}`, 80);
+      }
+    });
+  });
+
+  return [...new Map(
+    candidates
+      .sort((left, right) => right.score - left.score)
+      .map((candidate) => [candidate.label, candidate.label])
+  ).values()].slice(0, 3);
 };
 
 export default function Home() {
@@ -190,6 +592,8 @@ export default function Home() {
   const [newContractAddress, setNewContractAddress] = useState('');
   const [newContractDeploymentBlock, setNewContractDeploymentBlock] = useState('');
   const configRef = useRef<ConfigData | null>(null);
+  const sourceBundleCacheRef = useRef<Record<string, VerifiedSourceBundle | null>>({});
+  const abiCacheRef = useRef<Record<string, string | null>>({});
 
   useEffect(() => {
     configRef.current = config;
@@ -401,23 +805,96 @@ export default function Home() {
     chain: AppChainConfig,
     contract: TrackedContractConfig
   ): Promise<string | null> => {
-    if (!configRef.current?.etherscanApiKey) return contract.abi || null;
-    if (contract.abi) return contract.abi;
+    return fetchAbiForAddress(chain, contract.address, contract);
+  };
+
+  const fetchAbiForAddress = async (
+    chain: AppChainConfig,
+    address: string,
+    trackedContract?: TrackedContractConfig | null
+  ): Promise<string | null> => {
+    const cacheKey = `${chain.id}:${address.toLowerCase()}`;
+    if (cacheKey in abiCacheRef.current) {
+      return abiCacheRef.current[cacheKey];
+    }
+
+    if (trackedContract?.abi) {
+      abiCacheRef.current[cacheKey] = trackedContract.abi;
+      return trackedContract.abi;
+    }
+
+    if (!configRef.current?.etherscanApiKey) {
+      abiCacheRef.current[cacheKey] = null;
+      return null;
+    }
 
     try {
-      const url = `${ETHERSCAN_API_V2_URL}?chainid=${chain.chainId}&module=contract&action=getabi&address=${contract.address}&apikey=${configRef.current.etherscanApiKey}`;
+      const url = `${ETHERSCAN_API_V2_URL}?chainid=${chain.chainId}&module=contract&action=getabi&address=${address}&apikey=${configRef.current.etherscanApiKey}`;
       const response = await fetch(url);
       const data = await response.json();
 
       if (data.status === '1' && typeof data.result === 'string' && data.result.startsWith('[')) {
-        persistContractAbi(chain.id, contract.id, data.result);
+        abiCacheRef.current[cacheKey] = data.result;
+        if (trackedContract && trackedContract.address.toLowerCase() === address.toLowerCase()) {
+          persistContractAbi(chain.id, trackedContract.id, data.result);
+        }
         return data.result;
       }
     } catch (err) {
-      console.warn(`Unable to fetch ABI for ${contract.address}:`, err);
+      console.warn(`Unable to fetch ABI for ${address}:`, err);
     }
 
+    abiCacheRef.current[cacheKey] = null;
     return null;
+  };
+
+  const fetchContractSourceBundle = async (
+    chain: AppChainConfig,
+    contract: TrackedContractConfig
+  ): Promise<VerifiedSourceBundle | null> => {
+    return fetchSourceBundleForAddress(chain, contract.address, contract.name);
+  };
+
+  const fetchSourceBundleForAddress = async (
+    chain: AppChainConfig,
+    address: string,
+    fallbackName: string
+  ): Promise<VerifiedSourceBundle | null> => {
+    const cacheKey = `${chain.id}:${address.toLowerCase()}`;
+    if (cacheKey in sourceBundleCacheRef.current) {
+      return sourceBundleCacheRef.current[cacheKey];
+    }
+
+    if (!configRef.current?.etherscanApiKey) {
+      sourceBundleCacheRef.current[cacheKey] = null;
+      return null;
+    }
+
+    try {
+      const url =
+        `${ETHERSCAN_API_V2_URL}?chainid=${chain.chainId}` +
+        `&module=contract&action=getsourcecode&address=${address}` +
+        `&apikey=${configRef.current.etherscanApiKey}`;
+      const response = await fetch(url);
+      const data = await response.json();
+      const result = Array.isArray(data.result) ? data.result[0] : null;
+
+      if (!result || typeof result.SourceCode !== 'string') {
+        sourceBundleCacheRef.current[cacheKey] = null;
+        return null;
+      }
+
+      const bundle = parseVerifiedSourceCode(
+        result.SourceCode,
+        typeof result.ContractName === 'string' ? result.ContractName : fallbackName
+      );
+      sourceBundleCacheRef.current[cacheKey] = bundle;
+      return bundle;
+    } catch (err) {
+      console.warn(`Unable to fetch source code for ${address}:`, err);
+      sourceBundleCacheRef.current[cacheKey] = null;
+      return null;
+    }
   };
 
   const analyzeFailedTransactions = async (
@@ -429,11 +906,16 @@ export default function Home() {
 
     const provider = new ethers.JsonRpcProvider(chain.rpcUrl);
     const abi = await fetchContractAbi(chain, contract);
+    const sourceBundle = await fetchContractSourceBundle(chain, contract);
 
     for (let i = 0; i < failedTxs.length; i += 1) {
       const tx = failedTxs[i];
       const progressPercent = Math.round(((i + 1) / failedTxs.length) * 100);
       setCurrentProgress(`Analyzing error details... ${i + 1}/${failedTxs.length} (${progressPercent}%)`);
+      let decodeAddress = contract.address;
+      let decodeAbi = abi;
+      let decodeSourceBundle = sourceBundle;
+      let traceSummary: string[] = [];
 
       try {
         const txDetails = await provider.getTransaction(tx.hash);
@@ -445,6 +927,7 @@ export default function Home() {
           tx.errorReason = 'Out of gas - transaction consumed all available gas';
           tx.errorName = 'OUT_OF_GAS';
           tx.decodedErrorSignature = 'OutOfGas()';
+          tx.traceStatus = 'Not needed - out of gas identified from receipt';
           continue;
         }
 
@@ -503,6 +986,33 @@ export default function Home() {
           }
         };
 
+        try {
+          const trace = await provider.send('debug_traceTransaction', [
+            tx.hash,
+            {
+              tracer: 'callTracer'
+            }
+          ]) as TraceCallFrame;
+          const failingFrame = findDeepestFailingTraceFrame(trace);
+
+          if (failingFrame) {
+            preferError(failingFrame, 'debug_traceTransaction');
+            traceSummary = buildTraceSummary(failingFrame);
+
+            if (failingFrame.to && ethers.isAddress(failingFrame.to)) {
+              decodeAddress = ethers.getAddress(failingFrame.to);
+              decodeAbi = await fetchAbiForAddress(chain, decodeAddress, null);
+              decodeSourceBundle = await fetchSourceBundleForAddress(
+                chain,
+                decodeAddress,
+                decodeAddress
+              );
+            }
+          }
+        } catch (traceError) {
+          traceSummary = [summarizeTraceError(traceError)];
+        }
+
         if (blockTag !== undefined) {
           try {
             await provider.send('eth_call', [rawCallRequest, ethers.toQuantity(blockTag)]);
@@ -529,6 +1039,8 @@ export default function Home() {
           tx.decodedErrorSignature = 'StateDependentFailure()';
           tx.errorDecodeStatus = 'No RPC error payload returned';
           tx.errorProbeSource = 'none';
+          tx.traceStatus = traceSummary.length > 0 ? 'Trace checked but did not return a failing frame' : 'Trace unavailable';
+          tx.traceSummary = traceSummary;
           continue;
         }
 
@@ -538,8 +1050,8 @@ export default function Home() {
         const errorData = extractErrorData(callError);
         const errorSelector = extractErrorSelector(callError);
         const decodedError =
-          (errorData ? decodeError(errorData, contract.address, abi) : null) ||
-          (errorSelector ? matchErrorSelector(errorSelector, contract.address, abi) : null);
+          (errorData ? decodeError(errorData, decodeAddress, decodeAbi) : null) ||
+          (errorSelector ? matchErrorSelector(errorSelector, decodeAddress, decodeAbi) : null);
         const error = callError as {
           code?: string;
           reason?: string;
@@ -559,6 +1071,22 @@ export default function Home() {
             : `Matched by selector only (${decodedError.source})`;
           tx.errorProbeSource = error.__probeSource || 'unknown';
           tx.errorDebugRaw = safeStringifyError(callError);
+          tx.sourceLocationMatches = findLikelySourceLocations(
+            decodeSourceBundle,
+            tx.functionName,
+            decodedError.selector,
+            decodedError.displayName,
+            decodedError.fullText
+          );
+          tx.sourceLocationStatus = tx.sourceLocationMatches.length > 0
+            ? 'Likely source match from function body + selector'
+            : decodeSourceBundle
+              ? 'Verified source found, but no likely source line match yet'
+              : 'Verified source unavailable for source-line matching';
+          tx.traceStatus = (error.__probeSource || '').includes('debug_traceTransaction')
+            ? 'Decoded from failing trace frame'
+            : 'Decoded without trace frame';
+          tx.traceSummary = traceSummary;
           continue;
         }
 
@@ -574,6 +1102,20 @@ export default function Home() {
               : 'RPC returned reason text only';
           tx.errorProbeSource = error.__probeSource || 'unknown';
           tx.errorDebugRaw = safeStringifyError(callError);
+          tx.sourceLocationMatches = findLikelySourceLocations(
+            decodeSourceBundle,
+            tx.functionName,
+            tx.errorSelector,
+            tx.errorName,
+            tx.errorReason
+          );
+          tx.sourceLocationStatus = tx.sourceLocationMatches.length > 0
+            ? 'Likely source match from function body + selector'
+            : decodeSourceBundle
+              ? 'Verified source found, but no likely source line match yet'
+              : 'Verified source unavailable for source-line matching';
+          tx.traceStatus = traceSummary.length > 0 ? 'Trace checked' : 'Trace unavailable';
+          tx.traceSummary = traceSummary;
           continue;
         }
 
@@ -589,6 +1131,20 @@ export default function Home() {
             : 'RPC returned no revert hex';
         tx.errorProbeSource = error.__probeSource || 'unknown';
         tx.errorDebugRaw = safeStringifyError(callError);
+        tx.sourceLocationMatches = findLikelySourceLocations(
+          decodeSourceBundle,
+          tx.functionName,
+          tx.errorSelector,
+          tx.errorName,
+          tx.errorReason
+        );
+        tx.sourceLocationStatus = tx.sourceLocationMatches.length > 0
+          ? 'Likely source match from function body + selector'
+          : decodeSourceBundle
+            ? 'Verified source found, but no likely source line match yet'
+            : 'Verified source unavailable for source-line matching';
+        tx.traceStatus = traceSummary.length > 0 ? 'Trace checked' : 'Trace unavailable';
+        tx.traceSummary = traceSummary;
       }
 
       if (i > 0 && i % 10 === 0) {
@@ -690,6 +1246,12 @@ export default function Home() {
           newTransactionsFound += newTxs.length;
         } else {
           allFailedTxs = [...allFailedTxs, ...convertedTxs];
+        }
+
+        if (isInitialFetch && allFailedTxs.length >= 5) {
+          allFailedTxs = allFailedTxs.slice(0, 5);
+          hasMore = false;
+          break;
         }
 
         if (allFailedTxs.length >= APP_CONFIG.MAX_FAILED_TRANSACTIONS) {
@@ -1369,6 +1931,30 @@ export default function Home() {
                           <div className="mt-1 whitespace-pre-wrap break-words text-gray-800">
                             {tx.errorReason || 'Unknown error'}
                           </div>
+                          <div className="mt-2 text-xs text-gray-700">
+                            Source: {tx.sourceLocationStatus || 'Not checked yet'}
+                          </div>
+                          <div className="mt-1 text-xs text-gray-700">
+                            Trace: {tx.traceStatus || 'Not checked yet'}
+                          </div>
+                          {tx.traceSummary && tx.traceSummary.length > 0 && (
+                            <div className="mt-1 rounded bg-slate-50 p-2 text-xs text-gray-700">
+                              {tx.traceSummary.map((item) => (
+                                <div key={item} className="font-mono">
+                                  {item}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {tx.sourceLocationMatches && tx.sourceLocationMatches.length > 0 && (
+                            <div className="mt-1 rounded bg-amber-50 p-2 text-xs text-gray-700">
+                              {tx.sourceLocationMatches.map((match) => (
+                                <div key={match} className="font-mono">
+                                  {match}
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           {tx.errorDebugRaw && (
                             <details className="mt-2">
                               <summary className="cursor-pointer text-xs text-gray-600">
