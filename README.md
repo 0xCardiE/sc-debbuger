@@ -1,6 +1,8 @@
-# Swarm Smart Contracts Errors Monitor
+# Smart Contract Error Monitor
 
-A Next.js application for monitoring failed transactions across multiple blockchain networks. Currently supports **Sepolia Testnet** and **Gnosis Chain**, tracking multiple smart contracts on each chain.
+A Next.js application for monitoring **failed transactions** for **any EVM contract** you configure, across **multiple chains**. Use it as a general-purpose scanner: add chain RPCs and contract addresses (with optional deployment blocks), fetch failures from the block explorer API, and replay / decode revert data via your RPC.
+
+Default presets still include **Sepolia** and **Gnosis** example contracts for convenience; the app is not limited to a single protocol.
 
 ## 🚀 Features
 

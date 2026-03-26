@@ -1445,7 +1445,7 @@ export default function Home() {
       <div className="container mx-auto px-4">
         <div className="rounded-lg bg-white p-6 shadow-lg">
           <div className="mb-6 flex items-center justify-between">
-            <h1 className="text-3xl font-bold text-gray-800">Swarm Smart Contract Error Monitor</h1>
+            <h1 className="text-3xl font-bold text-gray-800">Smart Contract Error Monitor</h1>
             <button
               onClick={() => setIsConfigModalOpen(true)}
               className="rounded-full p-2 text-gray-600 transition-colors hover:bg-gray-100 hover:text-gray-800"
