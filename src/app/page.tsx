@@ -163,6 +163,7 @@ const collectHexStrings = (
 const scoreHexCandidate = (candidate: { value: string; path: string }): number => {
   let score = 0;
   const pathParts = candidate.path.split('.');
+  const pathLower = candidate.path.toLowerCase();
 
   if (candidate.value.length > ADDRESS_HEX_LENGTH) score += 20;
   if (candidate.value.length === SELECTOR_HEX_LENGTH) score += 5;
@@ -171,6 +172,11 @@ const scoreHexCandidate = (candidate: { value: string; path: string }): number =
   if (pathParts.some((part) => REVERT_DATA_FIELD_NAMES.has(part))) score += 50;
   if (candidate.path.includes('error')) score += 15;
   if (candidate.path.includes('message')) score -= 10;
+
+  // eth_call calldata lives here — first 4 bytes look like an "error" but are the function selector
+  if (pathLower.includes('transaction') && pathLower.includes('data')) score -= 120;
+  if (pathLower.endsWith('.input') || pathLower.includes('.input.')) score -= 120;
+  if (pathLower.includes('params[0]') && pathLower.includes('data')) score -= 120;
 
   return score;
 };
@@ -199,6 +205,105 @@ const extractErrorSelector = (error: unknown): string | null => {
     .filter((candidate) => !isLikelyAddress(candidate))
     .map((candidate) => candidate.slice(0, SELECTOR_HEX_LENGTH))
     .find((candidate) => candidate.length === SELECTOR_HEX_LENGTH) || null;
+};
+
+const normalizeCalldataLower = (value: string | undefined | null): string => {
+  if (!value || typeof value !== 'string') return '';
+  const n = normalizeHexCandidate(value);
+  return n ? n.toLowerCase() : value.toLowerCase();
+};
+
+const isSameHexAsCalldata = (revertHex: string, calldataLower: string): boolean => {
+  const cal = calldataLower.toLowerCase();
+  if (!cal || cal === '0x') return false;
+  return revertHex.toLowerCase() === cal;
+};
+
+const looksLikeCallTracerFrame = (value: unknown): value is TraceCallFrame =>
+  Boolean(
+    value &&
+      typeof value === 'object' &&
+      ('calls' in value || ('type' in value && 'input' in value))
+  );
+
+/** `output` on a callTracer frame is returndata / revert blob; `input` is calldata. */
+const extractRevertOutputFromTraceFrame = (
+  frame: TraceCallFrame | null | undefined,
+  calldataLower: string
+): string | null => {
+  if (!frame?.output) return null;
+  const normalized = normalizeHexCandidate(frame.output);
+  if (!normalized || normalized.length < 10) return null;
+  if (isSameHexAsCalldata(normalized, calldataLower)) return null;
+  return normalized;
+};
+
+/** EIP-1474 / node revert hex under ethers `info.error`, not the eth_call `data` param. */
+const extractNestedJsonRpcRevertHex = (info: unknown, calldataLower: string): string | null => {
+  if (!info || typeof info !== 'object') return null;
+  const tryData = (data: unknown): string | null => {
+    if (typeof data !== 'string') return null;
+    const normalized = normalizeHexCandidate(data);
+    if (!normalized || normalized.length < 10) return null;
+    if (isSameHexAsCalldata(normalized, calldataLower)) return null;
+    return normalized;
+  };
+  const rec = info as { error?: { data?: unknown }; data?: unknown };
+  const fromNestedError = tryData(rec.error?.data);
+  if (fromNestedError) return fromNestedError;
+  const fromInfoRoot = tryData(rec.data);
+  if (fromInfoRoot) return fromInfoRoot;
+  return null;
+};
+
+const walkTraceFramesForRevertOutput = (
+  frame: TraceCallFrame | null | undefined,
+  calldataLower: string
+): string | null => {
+  if (!frame) return null;
+  for (const child of frame.calls || []) {
+    const inner = walkTraceFramesForRevertOutput(child, calldataLower);
+    if (inner) return inner;
+  }
+  return extractRevertOutputFromTraceFrame(frame, calldataLower);
+};
+
+/**
+ * Actual revert payload (custom error / Error(string) / Panic), not the tx calldata.
+ * Order: trace returndata, ethers CALL_EXCEPTION.data, JSON-RPC error.data.
+ */
+const extractRevertDataHex = (error: unknown, calldataLower: string): string | null => {
+  const cal = calldataLower.toLowerCase();
+
+  if (looksLikeCallTracerFrame(error)) {
+    const deepest = findDeepestFailingTraceFrame(error);
+    const fromDeepest = extractRevertOutputFromTraceFrame(deepest, cal);
+    if (fromDeepest) return fromDeepest;
+    const fromWalk = walkTraceFramesForRevertOutput(error, cal);
+    if (fromWalk) return fromWalk;
+  }
+
+  const maybe = error as { code?: string; data?: unknown; info?: unknown };
+  if (maybe.code === 'CALL_EXCEPTION') {
+    if (typeof maybe.data === 'string') {
+      const normalized = normalizeHexCandidate(maybe.data);
+      if (normalized && normalized.length >= 10 && !isSameHexAsCalldata(normalized, cal)) {
+        return normalized;
+      }
+    }
+    const nested = extractNestedJsonRpcRevertHex(maybe.info, cal);
+    if (nested) return nested;
+  }
+
+  const topNested = extractNestedJsonRpcRevertHex(error, cal);
+  if (topNested) return topNested;
+
+  return null;
+};
+
+const selectorFromRevertHex = (revertHex: string | null): string | null => {
+  if (!revertHex || revertHex.length < SELECTOR_HEX_LENGTH) return null;
+  return revertHex.slice(0, SELECTOR_HEX_LENGTH).toLowerCase();
 };
 
 const getErrorText = (error: unknown): string => {
@@ -270,6 +375,40 @@ const safeStringifyError = (error: unknown): string => {
   }
 };
 
+/** Thrown value may be null, a string, an Error, or a trace frame — never assume `.code` exists. */
+const readThrownError = (thrown: unknown): {
+  code?: string;
+  reason?: string;
+  message?: string;
+  shortMessage?: string;
+  probe?: string;
+} => {
+  if (thrown === null || thrown === undefined) {
+    return {};
+  }
+  if (typeof thrown === 'string') {
+    return { message: thrown };
+  }
+  if (typeof thrown !== 'object') {
+    return { message: String(thrown) };
+  }
+  const o = thrown as Record<string, unknown>;
+  let message = typeof o.message === 'string' ? o.message : undefined;
+  if (!message && typeof o.revertReason === 'string') {
+    message = o.revertReason;
+  }
+  if (!message && typeof o.error === 'string') {
+    message = o.error;
+  }
+  return {
+    code: typeof o.code === 'string' ? o.code : undefined,
+    reason: typeof o.reason === 'string' ? o.reason : undefined,
+    message,
+    shortMessage: typeof o.shortMessage === 'string' ? o.shortMessage : undefined,
+    probe: typeof o.__probeSource === 'string' ? o.__probeSource : undefined
+  };
+};
+
 const summarizeTraceError = (error: unknown): string => {
   const message = error instanceof Error ? error.message : String(error);
   const lowerMessage = message.toLowerCase();
@@ -289,9 +428,9 @@ const summarizeTraceError = (error: unknown): string => {
   return 'Trace unavailable: RPC could not provide a transaction trace. Using fallback replay instead.';
 };
 
-const hasUsefulRevertData = (error: unknown): boolean => {
-  const errorData = extractErrorData(error);
-  return Boolean(errorData && errorData.startsWith('0x') && errorData.length >= 10);
+const hasUsefulRevertData = (error: unknown, calldataLower: string): boolean => {
+  const revertHex = extractRevertDataHex(error, calldataLower);
+  return Boolean(revertHex && revertHex.length >= 10);
 };
 
 const needsErrorAnalysis = (tx: Transaction): boolean => {
@@ -302,16 +441,6 @@ const needsErrorAnalysis = (tx: Transaction): boolean => {
   if (tx.errorName === 'CALL_EXCEPTION' && !tx.errorDataRaw) return true;
   if (!tx.errorSelector && tx.errorDataRaw) return true;
   return false;
-};
-
-const getErrorBaseName = (errorName?: string): string | null => {
-  if (!errorName) return null;
-  const match = errorName.match(/^([A-Za-z0-9_]+)/);
-  if (!match) return null;
-  const baseName = match[1];
-  if (baseName === 'Error' || baseName === 'Panic' || baseName === 'CALL_EXCEPTION') return null;
-  if (baseName.startsWith('0x')) return null;
-  return baseName;
 };
 
 const getMethodBaseName = (functionName?: string): string | null => {
@@ -465,110 +594,57 @@ const extractDeclaredErrors = (sourceBundle: VerifiedSourceBundle | null): Array
   return declarations;
 };
 
-const findLikelySourceLocations = (
+/** Revert with a custom error: optional Library. prefix before the error name. */
+const REVERT_CUSTOM_ERROR =
+  /\brevert\s+(?:[A-Za-z0-9_]+\.)*([A-Za-z0-9_]+)\s*\(/g;
+
+/**
+ * Find `revert SomeError(...)` lines inside the transaction method body whose
+ * declared error selector equals the RPC revert selector (first 4 bytes).
+ */
+const findRevertLinesMatchingSelector = (
   sourceBundle: VerifiedSourceBundle | null,
-  functionName?: string,
-  errorSelector?: string,
-  errorName?: string,
-  errorReason?: string
+  functionName: string | undefined,
+  errorSelector: string | undefined
 ): string[] => {
   if (!sourceBundle) return [];
 
-  const methodBaseName = getMethodBaseName(functionName);
-  const errorBaseName = getErrorBaseName(errorName);
-  const reasonStringMatch = errorReason?.match(/^Error\((.*)\)$/);
-  const reasonString = reasonStringMatch?.[1] || '';
   const normalizedSelector = errorSelector?.toLowerCase();
-  const declaredErrors = extractDeclaredErrors(sourceBundle);
-  const candidates: Array<{ label: string; score: number }> = [];
+  if (!normalizedSelector || normalizedSelector.length !== SELECTOR_HEX_LENGTH) return [];
 
-  const addCandidate = (label: string, score: number) => {
-    candidates.push({ label, score });
-  };
+  const methodBaseName = getMethodBaseName(functionName);
+  if (!methodBaseName) return [];
 
-  if (methodBaseName) {
-    sourceBundle.files.forEach((file) => {
-      const blocks = extractFunctionBlocks(file, methodBaseName);
+  const declaredByName = new Map(
+    extractDeclaredErrors(sourceBundle).map((declaration) => [declaration.name, declaration])
+  );
 
-      blocks.forEach((block) => {
-        const blockLines = block.content.split('\n');
-
-        blockLines.forEach((line, index) => {
-          const absoluteLine = block.startLine + index;
-          const trimmedLine = line.trim();
-
-          if (errorBaseName && new RegExp(`\\brevert\\s+${errorBaseName}\\s*\\(`).test(trimmedLine)) {
-            addCandidate(`${block.path}:${absoluteLine} - ${trimmedLine}`, 200);
-          }
-
-          if (reasonString && trimmedLine.includes(reasonString)) {
-            addCandidate(`${block.path}:${absoluteLine} - ${trimmedLine}`, 180);
-          }
-
-          const referencedErrorNames = Array.from(trimmedLine.matchAll(/\brevert\s+([A-Za-z0-9_]+)\s*\(/g))
-            .map((match) => match[1]);
-
-          referencedErrorNames.forEach((referencedErrorName) => {
-            const declaration = declaredErrors.find((item) => item.name === referencedErrorName);
-            if (!declaration) return;
-
-            if (normalizedSelector && declaration.selector === normalizedSelector) {
-              addCandidate(
-                `${block.path}:${absoluteLine} - ${trimmedLine} [selector match ${normalizedSelector}]`,
-                250
-              );
-            } else if (errorBaseName && declaration.name === errorBaseName) {
-              addCandidate(`${block.path}:${absoluteLine} - ${trimmedLine}`, 190);
-            }
-          });
-        });
-      });
-    });
-  }
-
-  declaredErrors.forEach((declaration) => {
-    if (normalizedSelector && declaration.selector === normalizedSelector) {
-      addCandidate(
-        `${declaration.path}:${declaration.line} - ${declaration.declaration} [error declaration ${declaration.selector}]`,
-        120
-      );
-    } else if (errorBaseName && declaration.name === errorBaseName) {
-      addCandidate(
-        `${declaration.path}:${declaration.line} - ${declaration.declaration}`,
-        60
-      );
-    }
-  });
+  const matches: Array<{ label: string; line: number }> = [];
 
   sourceBundle.files.forEach((file) => {
-    const lines = file.content.split('\n');
-
-    lines.forEach((line, index) => {
-      const lineNumber = index + 1;
-      const trimmedLine = line.trim();
-
-      if (errorBaseName) {
-        if (new RegExp(`\\brevert\\s+${errorBaseName}\\s*\\(`).test(trimmedLine)) {
-          addCandidate(`${file.path}:${lineNumber} - ${trimmedLine}`, 100);
-          return;
+    extractFunctionBlocks(file, methodBaseName).forEach((block) => {
+      const blockLines = block.content.split('\n');
+      blockLines.forEach((line, index) => {
+        const absoluteLine = block.startLine + index;
+        const trimmed = line.trim();
+        REVERT_CUSTOM_ERROR.lastIndex = 0;
+        let revertMatch: RegExpExecArray | null;
+        while ((revertMatch = REVERT_CUSTOM_ERROR.exec(trimmed)) !== null) {
+          const errorName = revertMatch[1];
+          const declaration = declaredByName.get(errorName);
+          if (declaration && declaration.selector === normalizedSelector) {
+            matches.push({
+              label: `${block.path}:${absoluteLine} - ${trimmed} [${declaration.signature} → ${normalizedSelector}]`,
+              line: absoluteLine
+            });
+          }
         }
-
-        if (new RegExp(`\\berror\\s+${errorBaseName}\\s*\\(`).test(trimmedLine)) {
-          addCandidate(`${file.path}:${lineNumber} - ${trimmedLine}`, 30);
-        }
-      }
-
-      if (reasonString && trimmedLine.includes(reasonString)) {
-        addCandidate(`${file.path}:${lineNumber} - ${trimmedLine}`, 80);
-      }
+      });
     });
   });
 
-  return [...new Map(
-    candidates
-      .sort((left, right) => right.score - left.score)
-      .map((candidate) => [candidate.label, candidate.label])
-  ).values()].slice(0, 3);
+  matches.sort((left, right) => left.line - right.line);
+  return [...new Map(matches.map((item) => [item.label, item.label])).values()].slice(0, 5);
 };
 
 export default function Home() {
@@ -921,7 +997,6 @@ export default function Home() {
         const txDetails = await provider.getTransaction(tx.hash);
         const gasUsed = Number(tx.gasUsed);
         const gasLimit = txDetails ? Number(txDetails.gasLimit) : 0;
-        const blockTag = tx.blockNumber > 0 ? BigInt(tx.blockNumber - 1) : undefined;
 
         if (gasUsed > 0 && gasLimit > 0 && gasUsed >= gasLimit * 0.99) {
           tx.errorReason = 'Out of gas - transaction consumed all available gas';
@@ -959,13 +1034,17 @@ export default function Home() {
           accessList: transactionRequest.accessList ?? undefined
         };
 
+        const replayCalldataLower = normalizeCalldataLower(
+          typeof transactionRequest.data === 'string' ? transactionRequest.data : String(tx.input || '0x')
+        );
+
         let bestError: unknown = null;
         let bestErrorProbe = 'none';
 
         const preferError = (candidate: unknown, source: string) => {
           if (!candidate) return;
-          const candidateHasHex = hasUsefulRevertData(candidate);
-          const bestHasHex = hasUsefulRevertData(bestError);
+          const candidateHasHex = hasUsefulRevertData(candidate, replayCalldataLower);
+          const bestHasHex = hasUsefulRevertData(bestError, replayCalldataLower);
           const candidateText = getErrorText(candidate);
           const bestText = getErrorText(bestError);
 
@@ -996,7 +1075,7 @@ export default function Home() {
           const failingFrame = findDeepestFailingTraceFrame(trace);
 
           if (failingFrame) {
-            preferError(failingFrame, 'debug_traceTransaction');
+            preferError(trace, 'debug_traceTransaction');
             traceSummary = buildTraceSummary(failingFrame);
 
             if (failingFrame.to && ethers.isAddress(failingFrame.to)) {
@@ -1013,11 +1092,14 @@ export default function Home() {
           traceSummary = [summarizeTraceError(traceError)];
         }
 
-        if (blockTag !== undefined) {
-          try {
-            await provider.send('eth_call', [rawCallRequest, ethers.toQuantity(blockTag)]);
-          } catch (errorAtHistoricalBlock) {
-            preferError(errorAtHistoricalBlock, 'eth_call@historical');
+        if (tx.blockNumber > 0) {
+          const historicalTags = [BigInt(tx.blockNumber - 1), BigInt(tx.blockNumber)];
+          for (const tag of historicalTags) {
+            try {
+              await provider.send('eth_call', [rawCallRequest, ethers.toQuantity(tag)]);
+            } catch (errorAtHistoricalBlock) {
+              preferError(errorAtHistoricalBlock, `eth_call@block ${tag}`);
+            }
           }
         }
 
@@ -1044,21 +1126,53 @@ export default function Home() {
           continue;
         }
 
-        (bestError as { __probeSource?: string }).__probeSource = bestErrorProbe;
+        if (bestError !== null && typeof bestError === 'object') {
+          (bestError as { __probeSource?: string }).__probeSource = bestErrorProbe;
+        }
         throw bestError;
       } catch (callError) {
-        const errorData = extractErrorData(callError);
-        const errorSelector = extractErrorSelector(callError);
+        // Use tx.input only: if getTransaction threw, transactionRequest was never assigned.
+        const replayCalldataLowerCatch = normalizeCalldataLower(String(tx.input || '0x'));
+        const meta = readThrownError(callError);
+        let resolvedErrorData = extractRevertDataHex(callError, replayCalldataLowerCatch);
+        let resolvedProbe = meta.probe;
+        let usedLatestRevertFallback = false;
+
+        if (
+          !resolvedErrorData &&
+          tx.to &&
+          ethers.isAddress(tx.to) &&
+          typeof tx.input === 'string' &&
+          tx.input.length >= 10
+        ) {
+          try {
+            await provider.send('eth_call', [
+              {
+                from: tx.from,
+                to: tx.to,
+                data: tx.input,
+                value: ethers.toQuantity(BigInt(tx.value || '0'))
+              },
+              'latest'
+            ]);
+          } catch (latestCallError) {
+            const fromLatest = extractRevertDataHex(latestCallError, replayCalldataLowerCatch);
+            if (fromLatest) {
+              resolvedErrorData = fromLatest;
+              resolvedProbe = 'eth_call@latest';
+              usedLatestRevertFallback = true;
+            }
+          }
+        }
+
+        const errorSelector = selectorFromRevertHex(resolvedErrorData);
         const decodedError =
-          (errorData ? decodeError(errorData, decodeAddress, decodeAbi) : null) ||
+          (resolvedErrorData ? decodeError(resolvedErrorData, decodeAddress, decodeAbi) : null) ||
           (errorSelector ? matchErrorSelector(errorSelector, decodeAddress, decodeAbi) : null);
-        const error = callError as {
-          code?: string;
-          reason?: string;
-          message?: string;
-          shortMessage?: string;
-          __probeSource?: string;
-        };
+
+        const latestRevertHint = usedLatestRevertFallback
+          ? ' Revert from eth_call@latest (current head — may differ from the tx block).'
+          : '';
 
         if (decodedError) {
           tx.errorName = decodedError.displayName;
@@ -1066,83 +1180,83 @@ export default function Home() {
           tx.errorDataRaw = decodedError.rawData;
           tx.errorSelector = decodedError.selector;
           tx.decodedErrorSignature = decodedError.displayName;
-          tx.errorDecodeStatus = decodedError.rawData.length > 10
-            ? `Decoded from full revert data (${decodedError.source})`
-            : `Matched by selector only (${decodedError.source})`;
-          tx.errorProbeSource = error.__probeSource || 'unknown';
+          tx.errorDecodeStatus =
+            (decodedError.rawData.length > 10
+              ? `Decoded from full revert data (${decodedError.source})`
+              : `Matched by selector only (${decodedError.source})`) + latestRevertHint;
+          tx.errorProbeSource = resolvedProbe || 'unknown';
           tx.errorDebugRaw = safeStringifyError(callError);
-          tx.sourceLocationMatches = findLikelySourceLocations(
+          tx.sourceLocationMatches = findRevertLinesMatchingSelector(
             decodeSourceBundle,
             tx.functionName,
-            decodedError.selector,
-            decodedError.displayName,
-            decodedError.fullText
+            decodedError.selector
           );
-          tx.sourceLocationStatus = tx.sourceLocationMatches.length > 0
-            ? 'Likely source match from function body + selector'
-            : decodeSourceBundle
-              ? 'Verified source found, but no likely source line match yet'
-              : 'Verified source unavailable for source-line matching';
-          tx.traceStatus = (error.__probeSource || '').includes('debug_traceTransaction')
+          tx.sourceLocationStatus =
+            tx.sourceLocationMatches.length > 0
+              ? 'Revert in transaction method matches RPC error selector (keccak4)'
+              : decodeSourceBundle
+                ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${decodedError.selector}`
+                : 'Verified source unavailable';
+          tx.traceStatus = (meta.probe || '').includes('debug_traceTransaction')
             ? 'Decoded from failing trace frame'
             : 'Decoded without trace frame';
           tx.traceSummary = traceSummary;
           continue;
         }
 
-        if (error.reason) {
-          tx.errorReason = error.reason;
-          tx.errorName = error.code || 'CALL_EXCEPTION';
+        if (meta.reason) {
+          tx.errorReason = meta.reason;
+          tx.errorName = meta.code || 'CALL_EXCEPTION';
           tx.errorSelector = errorSelector || undefined;
-          if (errorData) tx.errorDataRaw = errorData;
-          tx.errorDecodeStatus = errorData
-            ? 'RPC returned hex but decode failed'
-            : errorSelector
-              ? 'RPC returned selector only'
-              : 'RPC returned reason text only';
-          tx.errorProbeSource = error.__probeSource || 'unknown';
+          if (resolvedErrorData) tx.errorDataRaw = resolvedErrorData;
+          tx.errorDecodeStatus =
+            (resolvedErrorData
+              ? 'RPC returned hex but decode failed'
+              : errorSelector
+                ? 'RPC returned selector only'
+                : 'RPC returned reason text only') + latestRevertHint;
+          tx.errorProbeSource = resolvedProbe || 'unknown';
           tx.errorDebugRaw = safeStringifyError(callError);
-          tx.sourceLocationMatches = findLikelySourceLocations(
+          tx.sourceLocationMatches = findRevertLinesMatchingSelector(
             decodeSourceBundle,
             tx.functionName,
-            tx.errorSelector,
-            tx.errorName,
-            tx.errorReason
+            tx.errorSelector
           );
-          tx.sourceLocationStatus = tx.sourceLocationMatches.length > 0
-            ? 'Likely source match from function body + selector'
-            : decodeSourceBundle
-              ? 'Verified source found, but no likely source line match yet'
-              : 'Verified source unavailable for source-line matching';
+          tx.sourceLocationStatus =
+            tx.sourceLocationMatches.length > 0
+              ? 'Revert in transaction method matches RPC error selector (keccak4)'
+              : decodeSourceBundle
+                ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${tx.errorSelector || 'unknown'}`
+                : 'Verified source unavailable';
           tx.traceStatus = traceSummary.length > 0 ? 'Trace checked' : 'Trace unavailable';
           tx.traceSummary = traceSummary;
           continue;
         }
 
-        const fallbackMessage = error.shortMessage || error.message || 'Transaction failed - reason unknown';
+        const fallbackMessage =
+          meta.shortMessage || meta.message || 'Transaction failed - reason unknown';
         tx.errorReason = fallbackMessage;
-        tx.errorName = error.code || 'UNKNOWN_ERROR';
+        tx.errorName = meta.code || 'UNKNOWN_ERROR';
         tx.errorSelector = errorSelector || undefined;
-        if (errorData) tx.errorDataRaw = errorData;
-        tx.errorDecodeStatus = errorData
-          ? 'RPC returned hex but decode failed'
+        if (resolvedErrorData) tx.errorDataRaw = resolvedErrorData;
+        tx.errorDecodeStatus = resolvedErrorData
+          ? 'RPC returned hex but decode failed' + latestRevertHint
           : errorSelector
-            ? 'RPC returned selector only'
-            : 'RPC returned no revert hex';
-        tx.errorProbeSource = error.__probeSource || 'unknown';
+            ? 'RPC returned selector only' + latestRevertHint
+            : 'No revert hex from RPC. Use an archive JSON-RPC URL with full historical state, or decode the failure on the block explorer / simulation API (e.g. Tenderly).';
+        tx.errorProbeSource = resolvedProbe || 'unknown';
         tx.errorDebugRaw = safeStringifyError(callError);
-        tx.sourceLocationMatches = findLikelySourceLocations(
+        tx.sourceLocationMatches = findRevertLinesMatchingSelector(
           decodeSourceBundle,
           tx.functionName,
-          tx.errorSelector,
-          tx.errorName,
-          tx.errorReason
+          tx.errorSelector
         );
-        tx.sourceLocationStatus = tx.sourceLocationMatches.length > 0
-          ? 'Likely source match from function body + selector'
-          : decodeSourceBundle
-            ? 'Verified source found, but no likely source line match yet'
-            : 'Verified source unavailable for source-line matching';
+        tx.sourceLocationStatus =
+          tx.sourceLocationMatches.length > 0
+            ? 'Revert in transaction method matches RPC error selector (keccak4)'
+            : decodeSourceBundle
+              ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${tx.errorSelector || 'none'}`
+              : 'Verified source unavailable';
         tx.traceStatus = traceSummary.length > 0 ? 'Trace checked' : 'Trace unavailable';
         tx.traceSummary = traceSummary;
       }
