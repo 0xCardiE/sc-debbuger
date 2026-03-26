@@ -45,8 +45,9 @@ interface Transaction {
   errorProbeSource?: string;
   sourceLocationStatus?: string;
   sourceLocationMatches?: string[];
+  /** Short RPC label: Inclusion, Parent, Latest, Estimate gas, Receipt */
+  revertFetchMethod?: string;
   traceStatus?: string;
-  traceSummary?: string[];
 }
 
 interface EtherscanTransaction {
@@ -305,21 +306,6 @@ const selectorFromRevertHex = (revertHex: string | null): string | null => {
   return revertHex.slice(0, SELECTOR_HEX_LENGTH).toLowerCase();
 };
 
-const getErrorText = (error: unknown): string => {
-  if (!error || typeof error !== 'object') return '';
-
-  const maybeError = error as {
-    reason?: string;
-    shortMessage?: string;
-    message?: string;
-  };
-
-  return [maybeError.reason, maybeError.shortMessage, maybeError.message]
-    .filter((value): value is string => typeof value === 'string' && value.length > 0)
-    .join(' | ')
-    .toLowerCase();
-};
-
 const isTraceFrameFailing = (frame: TraceCallFrame | null | undefined): boolean => {
   if (!frame) return false;
   return Boolean(frame.error || frame.revertReason || (frame.output && frame.output !== '0x'));
@@ -334,83 +320,6 @@ const findDeepestFailingTraceFrame = (frame: TraceCallFrame | null | undefined):
   }
 
   return isTraceFrameFailing(frame) ? frame : null;
-};
-
-const buildTraceSummary = (frame: TraceCallFrame | null | undefined): string[] => {
-  if (!frame) return [];
-
-  const summary: string[] = [];
-  let current: TraceCallFrame | undefined | null = frame;
-
-  while (current) {
-    const parts = [
-      current.type || 'CALL',
-      current.to || 'unknown-target',
-      current.revertReason || current.error || ''
-    ].filter(Boolean);
-    summary.push(parts.join(' - '));
-    current = current.calls && current.calls.length > 0 ? current.calls[0] : null;
-  }
-
-  return summary.slice(0, 5);
-};
-
-/** Thrown value may be null, a string, an Error, or a trace frame — never assume `.code` exists. */
-const readThrownError = (thrown: unknown): {
-  code?: string;
-  reason?: string;
-  message?: string;
-  shortMessage?: string;
-  probe?: string;
-} => {
-  if (thrown === null || thrown === undefined) {
-    return {};
-  }
-  if (typeof thrown === 'string') {
-    return { message: thrown };
-  }
-  if (typeof thrown !== 'object') {
-    return { message: String(thrown) };
-  }
-  const o = thrown as Record<string, unknown>;
-  let message = typeof o.message === 'string' ? o.message : undefined;
-  if (!message && typeof o.revertReason === 'string') {
-    message = o.revertReason;
-  }
-  if (!message && typeof o.error === 'string') {
-    message = o.error;
-  }
-  return {
-    code: typeof o.code === 'string' ? o.code : undefined,
-    reason: typeof o.reason === 'string' ? o.reason : undefined,
-    message,
-    shortMessage: typeof o.shortMessage === 'string' ? o.shortMessage : undefined,
-    probe: typeof o.__probeSource === 'string' ? o.__probeSource : undefined
-  };
-};
-
-const summarizeTraceError = (error: unknown): string => {
-  const message = error instanceof Error ? error.message : String(error);
-  const lowerMessage = message.toLowerCase();
-
-  if (lowerMessage.includes('no state available for block')) {
-    return 'Trace unavailable: RPC lacks historical state for this block. Using fallback replay instead.';
-  }
-
-  if (lowerMessage.includes('method not found') || lowerMessage.includes('-32601')) {
-    return 'Trace unavailable: RPC does not support debug tracing. Using fallback replay instead.';
-  }
-
-  if (lowerMessage.includes('missing trie node')) {
-    return 'Trace unavailable: RPC is missing required archive state. Using fallback replay instead.';
-  }
-
-  return 'Trace unavailable: RPC could not provide a transaction trace. Using fallback replay instead.';
-};
-
-const hasUsefulRevertData = (error: unknown, calldataLower: string): boolean => {
-  const revertHex = extractRevertDataHex(error, calldataLower);
-  return Boolean(revertHex && revertHex.length >= 10);
 };
 
 const needsErrorAnalysis = (tx: Transaction): boolean => {
@@ -971,10 +880,71 @@ export default function Home() {
       let decodeAddress = contract.address;
       let decodeAbi = abi;
       let decodeSourceBundle = sourceBundle;
-      let traceSummary: string[] = [];
+
+      const applyRevertToTx = (
+        resolvedErrorData: string,
+        revertFetchMethod: string
+      ) => {
+        const errorSelector = selectorFromRevertHex(resolvedErrorData);
+        const decodedError =
+          decodeError(resolvedErrorData, decodeAddress, decodeAbi) ||
+          (errorSelector ? matchErrorSelector(errorSelector, decodeAddress, decodeAbi) : null);
+
+        tx.revertFetchMethod = revertFetchMethod;
+        tx.errorProbeSource = revertFetchMethod;
+
+        if (decodedError) {
+          tx.errorName = decodedError.displayName;
+          tx.errorReason = decodedError.fullText;
+          tx.errorDataRaw = decodedError.rawData;
+          tx.errorSelector = decodedError.selector;
+          tx.decodedErrorSignature = decodedError.displayName;
+          tx.errorDecodeStatus =
+            decodedError.rawData.length > 10
+              ? `Decoded from full revert data (${decodedError.source})`
+              : `Matched by selector only (${decodedError.source})`;
+          tx.sourceLocationMatches = findRevertLinesMatchingSelector(
+            decodeSourceBundle,
+            tx.functionName,
+            decodedError.selector
+          );
+          tx.sourceLocationStatus =
+            tx.sourceLocationMatches.length > 0
+              ? 'Revert in transaction method matches RPC error selector (keccak4)'
+              : decodeSourceBundle
+                ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${decodedError.selector}`
+                : 'Verified source unavailable';
+          tx.traceStatus = revertFetchMethod;
+          return;
+        }
+
+        tx.errorReason = resolvedErrorData;
+        tx.errorName = 'UNKNOWN_ERROR';
+        tx.errorSelector = errorSelector || undefined;
+        tx.errorDataRaw = resolvedErrorData;
+        tx.errorDecodeStatus = 'RPC returned hex but decode failed';
+        tx.sourceLocationMatches = findRevertLinesMatchingSelector(
+          decodeSourceBundle,
+          tx.functionName,
+          tx.errorSelector
+        );
+        tx.sourceLocationStatus =
+          tx.sourceLocationMatches.length > 0
+            ? 'Revert in transaction method matches RPC error selector (keccak4)'
+            : decodeSourceBundle
+              ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${tx.errorSelector || 'none'}`
+              : 'Verified source unavailable';
+        tx.traceStatus = revertFetchMethod;
+      };
 
       try {
-        const txDetails = await provider.getTransaction(tx.hash);
+        let txDetails: ethers.TransactionResponse | null = null;
+        try {
+          txDetails = await provider.getTransaction(tx.hash);
+        } catch {
+          txDetails = null;
+        }
+
         const gasUsed = Number(tx.gasUsed);
         const gasLimit = txDetails ? Number(txDetails.gasLimit) : 0;
 
@@ -982,7 +952,8 @@ export default function Home() {
           tx.errorReason = 'Out of gas - transaction consumed all available gas';
           tx.errorName = 'OUT_OF_GAS';
           tx.decodedErrorSignature = 'OutOfGas()';
-          tx.traceStatus = 'Not needed - out of gas identified from receipt';
+          tx.traceStatus = 'Receipt';
+          tx.revertFetchMethod = 'Receipt';
           continue;
         }
 
@@ -1018,105 +989,78 @@ export default function Home() {
           typeof transactionRequest.data === 'string' ? transactionRequest.data : String(tx.input || '0x')
         );
 
-        let bestError: unknown = null;
-        let bestErrorProbe = 'none';
-
-        const preferError = (candidate: unknown, source: string) => {
-          if (!candidate) return;
-          const candidateHasHex = hasUsefulRevertData(candidate, replayCalldataLower);
-          const bestHasHex = hasUsefulRevertData(bestError, replayCalldataLower);
-          const candidateText = getErrorText(candidate);
-          const bestText = getErrorText(bestError);
-
-          const candidateScore =
-            (candidateHasHex ? 100 : 0) +
-            (candidateText.includes('execution reverted') ? 20 : 0) +
-            (candidateText.includes('panic') ? 10 : 0) +
-            (candidateText.includes('missing revert data') ? -20 : 0);
-          const bestScore =
-            (bestHasHex ? 100 : 0) +
-            (bestText.includes('execution reverted') ? 20 : 0) +
-            (bestText.includes('panic') ? 10 : 0) +
-            (bestText.includes('missing revert data') ? -20 : 0);
-
-          if (bestError === null || candidateScore > bestScore) {
-            bestError = candidate;
-            bestErrorProbe = source;
+        const ethCallRevertHex = async (blockTag: string | bigint): Promise<string | null> => {
+          try {
+            await provider.send('eth_call', [
+              rawCallRequest,
+              typeof blockTag === 'bigint' ? ethers.toQuantity(blockTag) : blockTag
+            ]);
+            return null;
+          } catch (err) {
+            return extractRevertDataHex(err, replayCalldataLower);
           }
         };
 
-        try {
-          const trace = await provider.send('debug_traceTransaction', [
-            tx.hash,
-            {
-              tracer: 'callTracer'
-            }
-          ]) as TraceCallFrame;
-          const failingFrame = findDeepestFailingTraceFrame(trace);
-
-          if (failingFrame) {
-            preferError(trace, 'debug_traceTransaction');
-            traceSummary = buildTraceSummary(failingFrame);
-
-            if (failingFrame.to && ethers.isAddress(failingFrame.to)) {
-              decodeAddress = ethers.getAddress(failingFrame.to);
-              decodeAbi = await fetchAbiForAddress(chain, decodeAddress, null);
-              decodeSourceBundle = await fetchSourceBundleForAddress(
-                chain,
-                decodeAddress,
-                decodeAddress
-              );
-            }
-          }
-        } catch (traceError) {
-          traceSummary = [summarizeTraceError(traceError)];
-        }
+        let resolvedErrorData: string | null = null;
+        let revertFetchMethod = '';
 
         if (tx.blockNumber > 0) {
-          const historicalTags = [BigInt(tx.blockNumber - 1), BigInt(tx.blockNumber)];
-          for (const tag of historicalTags) {
-            try {
-              await provider.send('eth_call', [rawCallRequest, ethers.toQuantity(tag)]);
-            } catch (errorAtHistoricalBlock) {
-              preferError(errorAtHistoricalBlock, `eth_call@block ${tag}`);
+          const hex = await ethCallRevertHex(BigInt(tx.blockNumber));
+          if (hex) {
+            resolvedErrorData = hex;
+            revertFetchMethod = 'Inclusion';
+          }
+        }
+
+        if (!resolvedErrorData && tx.blockNumber > 0) {
+          const hex = await ethCallRevertHex(BigInt(tx.blockNumber - 1));
+          if (hex) {
+            resolvedErrorData = hex;
+            revertFetchMethod = 'Parent';
+          }
+        }
+
+        if (!resolvedErrorData) {
+          try {
+            await provider.call(transactionRequest);
+          } catch (err) {
+            const hex = extractRevertDataHex(err, replayCalldataLower);
+            if (hex) {
+              resolvedErrorData = hex;
+              revertFetchMethod = 'Latest';
             }
           }
         }
 
-        try {
-          await provider.call(transactionRequest);
-        } catch (latestStateError) {
-          preferError(latestStateError, 'provider.call@latest');
+        if (!resolvedErrorData) {
+          try {
+            await provider.estimateGas(transactionRequest);
+          } catch (err) {
+            const hex = extractRevertDataHex(err, replayCalldataLower);
+            if (hex) {
+              resolvedErrorData = hex;
+              revertFetchMethod = 'Estimate gas';
+            }
+          }
         }
 
-        try {
-          await provider.estimateGas(transactionRequest);
-        } catch (estimateGasError) {
-          preferError(estimateGasError, 'estimateGas');
-        }
-
-        if (!bestError) {
+        if (!resolvedErrorData) {
           tx.errorReason = 'Transaction failed due to state changes or gas estimation.';
           tx.errorName = 'STATE_DEPENDENT_FAILURE';
           tx.decodedErrorSignature = 'StateDependentFailure()';
           tx.errorDecodeStatus = 'No RPC error payload returned';
           tx.errorProbeSource = 'none';
-          tx.traceStatus = traceSummary.length > 0 ? 'Trace checked but did not return a failing frame' : 'Trace unavailable';
-          tx.traceSummary = traceSummary;
+          tx.revertFetchMethod = undefined;
+          tx.traceStatus = '—';
           continue;
         }
 
-        if (bestError !== null && typeof bestError === 'object') {
-          (bestError as { __probeSource?: string }).__probeSource = bestErrorProbe;
-        }
-        throw bestError;
-      } catch (callError) {
-        // Use tx.input only: if getTransaction threw, transactionRequest was never assigned.
+        applyRevertToTx(resolvedErrorData, revertFetchMethod);
+        continue;
+      } catch (unexpected) {
         const replayCalldataLowerCatch = normalizeCalldataLower(String(tx.input || '0x'));
-        const meta = readThrownError(callError);
-        let resolvedErrorData = extractRevertDataHex(callError, replayCalldataLowerCatch);
-        let resolvedProbe = meta.probe;
-        let usedLatestRevertFallback = false;
+        let resolvedErrorData = extractRevertDataHex(unexpected, replayCalldataLowerCatch);
+        let revertFetchMethod = '';
 
         if (
           !resolvedErrorData &&
@@ -1135,107 +1079,28 @@ export default function Home() {
               },
               'latest'
             ]);
-          } catch (latestCallError) {
-            const fromLatest = extractRevertDataHex(latestCallError, replayCalldataLowerCatch);
-            if (fromLatest) {
-              resolvedErrorData = fromLatest;
-              resolvedProbe = 'eth_call@latest';
-              usedLatestRevertFallback = true;
+          } catch (latestErr) {
+            const h = extractRevertDataHex(latestErr, replayCalldataLowerCatch);
+            if (h) {
+              resolvedErrorData = h;
+              revertFetchMethod = 'Latest';
             }
           }
         }
 
-        const errorSelector = selectorFromRevertHex(resolvedErrorData);
-        const decodedError =
-          (resolvedErrorData ? decodeError(resolvedErrorData, decodeAddress, decodeAbi) : null) ||
-          (errorSelector ? matchErrorSelector(errorSelector, decodeAddress, decodeAbi) : null);
-
-        const latestRevertHint = usedLatestRevertFallback
-          ? ' Revert from eth_call@latest (current head — may differ from the tx block).'
-          : '';
-
-        if (decodedError) {
-          tx.errorName = decodedError.displayName;
-          tx.errorReason = decodedError.fullText;
-          tx.errorDataRaw = decodedError.rawData;
-          tx.errorSelector = decodedError.selector;
-          tx.decodedErrorSignature = decodedError.displayName;
+        if (resolvedErrorData) {
+          applyRevertToTx(resolvedErrorData, revertFetchMethod || 'Latest');
+        } else {
+          tx.errorReason =
+            unexpected instanceof Error ? unexpected.message : String(unexpected);
+          tx.errorName = 'UNKNOWN_ERROR';
           tx.errorDecodeStatus =
-            (decodedError.rawData.length > 10
-              ? `Decoded from full revert data (${decodedError.source})`
-              : `Matched by selector only (${decodedError.source})`) + latestRevertHint;
-          tx.errorProbeSource = resolvedProbe || 'unknown';
-          tx.sourceLocationMatches = findRevertLinesMatchingSelector(
-            decodeSourceBundle,
-            tx.functionName,
-            decodedError.selector
-          );
-          tx.sourceLocationStatus =
-            tx.sourceLocationMatches.length > 0
-              ? 'Revert in transaction method matches RPC error selector (keccak4)'
-              : decodeSourceBundle
-                ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${decodedError.selector}`
-                : 'Verified source unavailable';
-          tx.traceStatus = (meta.probe || '').includes('debug_traceTransaction')
-            ? 'Decoded from failing trace frame'
-            : 'Decoded without trace frame';
-          tx.traceSummary = traceSummary;
-          continue;
+            'Analysis failed unexpectedly. Check RPC URL and try re-analyze.';
+          tx.errorProbeSource = 'none';
+          tx.revertFetchMethod = undefined;
+          tx.traceStatus = '—';
         }
-
-        if (meta.reason) {
-          tx.errorReason = meta.reason;
-          tx.errorName = meta.code || 'CALL_EXCEPTION';
-          tx.errorSelector = errorSelector || undefined;
-          if (resolvedErrorData) tx.errorDataRaw = resolvedErrorData;
-          tx.errorDecodeStatus =
-            (resolvedErrorData
-              ? 'RPC returned hex but decode failed'
-              : errorSelector
-                ? 'RPC returned selector only'
-                : 'RPC returned reason text only') + latestRevertHint;
-          tx.errorProbeSource = resolvedProbe || 'unknown';
-          tx.sourceLocationMatches = findRevertLinesMatchingSelector(
-            decodeSourceBundle,
-            tx.functionName,
-            tx.errorSelector
-          );
-          tx.sourceLocationStatus =
-            tx.sourceLocationMatches.length > 0
-              ? 'Revert in transaction method matches RPC error selector (keccak4)'
-              : decodeSourceBundle
-                ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${tx.errorSelector || 'unknown'}`
-                : 'Verified source unavailable';
-          tx.traceStatus = traceSummary.length > 0 ? 'Trace checked' : 'Trace unavailable';
-          tx.traceSummary = traceSummary;
-          continue;
-        }
-
-        const fallbackMessage =
-          meta.shortMessage || meta.message || 'Transaction failed - reason unknown';
-        tx.errorReason = fallbackMessage;
-        tx.errorName = meta.code || 'UNKNOWN_ERROR';
-        tx.errorSelector = errorSelector || undefined;
-        if (resolvedErrorData) tx.errorDataRaw = resolvedErrorData;
-        tx.errorDecodeStatus = resolvedErrorData
-          ? 'RPC returned hex but decode failed' + latestRevertHint
-          : errorSelector
-            ? 'RPC returned selector only' + latestRevertHint
-            : 'No revert hex from RPC. Use an archive JSON-RPC URL with full historical state, or decode the failure on the block explorer / simulation API (e.g. Tenderly).';
-        tx.errorProbeSource = resolvedProbe || 'unknown';
-        tx.sourceLocationMatches = findRevertLinesMatchingSelector(
-          decodeSourceBundle,
-          tx.functionName,
-          tx.errorSelector
-        );
-        tx.sourceLocationStatus =
-          tx.sourceLocationMatches.length > 0
-            ? 'Revert in transaction method matches RPC error selector (keccak4)'
-            : decodeSourceBundle
-              ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${tx.errorSelector || 'none'}`
-              : 'Verified source unavailable';
-        tx.traceStatus = traceSummary.length > 0 ? 'Trace checked' : 'Trace unavailable';
-        tx.traceSummary = traceSummary;
+        continue;
       }
 
       if (i > 0 && i % 10 === 0) {
@@ -2028,13 +1893,9 @@ export default function Home() {
                             }
                             return null;
                           })()}
-                          {tx.traceSummary && tx.traceSummary.length > 0 && (
-                            <div className="mt-1 rounded bg-slate-50 p-2 text-xs text-gray-700">
-                              {tx.traceSummary.map((item) => (
-                                <div key={item} className="font-mono">
-                                  {item}
-                                </div>
-                              ))}
+                          {tx.revertFetchMethod && (
+                            <div className="mt-1 rounded bg-slate-50 p-2 text-xs font-medium text-gray-700">
+                              {tx.revertFetchMethod}
                             </div>
                           )}
                           {tx.sourceLocationMatches && tx.sourceLocationMatches.length > 0 && (
