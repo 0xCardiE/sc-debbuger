@@ -459,9 +459,32 @@ function logContractDeclaredErrorsToConsole(
 const REVERT_CUSTOM_ERROR =
   /\brevert\s+(?:[A-Za-z0-9_]+\.)*([A-Za-z0-9_]+)\s*\(/g;
 
+const MAX_REVERT_LINES_IN_METHOD = 6;
+const MAX_REVERT_LINES_TOTAL = 22;
+
+const pushRevertMatchIfNew = (
+  seen: Set<string>,
+  out: string[],
+  path: string,
+  line: number,
+  trimmed: string,
+  signature: string,
+  normalizedSelector: string,
+  scopeNote: string
+): boolean => {
+  const key = `${path}:${line}`;
+  if (seen.has(key)) return false;
+  seen.add(key);
+  out.push(
+    `${path}:${line} — ${trimmed} [${signature} → ${normalizedSelector}] ${scopeNote}`
+  );
+  return true;
+};
+
 /**
- * Find `revert SomeError(...)` lines inside the transaction method body whose
- * declared error selector equals the RPC revert selector (first 4 bytes).
+ * Find `revert SomeError(...)` call sites whose declared selector matches the RPC revert.
+ * Tier 1: lines inside `function <txMethod>` (best guess for entrypoint).
+ * Tier 2: all other lines across the full Etherscan multi-file bundle (libraries, internal fns).
  */
 const findRevertLinesMatchingSelector = (
   sourceBundle: VerifiedSourceBundle | null,
@@ -473,39 +496,92 @@ const findRevertLinesMatchingSelector = (
   const normalizedSelector = errorSelector?.toLowerCase();
   if (!normalizedSelector || normalizedSelector.length !== SELECTOR_HEX_LENGTH) return [];
 
-  const methodBaseName = getMethodBaseName(functionName);
-  if (!methodBaseName) return [];
-
   const declaredByName = new Map(
     extractDeclaredErrors(sourceBundle).map((declaration) => [declaration.name, declaration])
   );
 
-  const matches: Array<{ label: string; line: number }> = [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const methodBaseName = getMethodBaseName(functionName);
+
+  let methodMatchCount = 0;
+
+  if (methodBaseName) {
+    sourceBundle.files.forEach((file) => {
+      extractFunctionBlocks(file, methodBaseName).forEach((block) => {
+        const blockLines = block.content.split('\n');
+        blockLines.forEach((line, index) => {
+          if (methodMatchCount >= MAX_REVERT_LINES_IN_METHOD) return;
+          const absoluteLine = block.startLine + index;
+          const trimmed = line.trim();
+          REVERT_CUSTOM_ERROR.lastIndex = 0;
+          let revertMatch: RegExpExecArray | null;
+          while ((revertMatch = REVERT_CUSTOM_ERROR.exec(trimmed)) !== null) {
+            if (methodMatchCount >= MAX_REVERT_LINES_IN_METHOD) break;
+            const errorName = revertMatch[1];
+            const declaration = declaredByName.get(errorName);
+            if (
+              declaration &&
+              declaration.selector.toLowerCase() === normalizedSelector.toLowerCase()
+            ) {
+              if (
+                pushRevertMatchIfNew(
+                  seen,
+                  out,
+                  block.path,
+                  absoluteLine,
+                  trimmed,
+                  declaration.signature,
+                  normalizedSelector,
+                  `· in ${methodBaseName}()`
+                )
+              ) {
+                methodMatchCount += 1;
+              }
+            }
+          }
+        });
+      });
+    });
+  }
+
+  if (out.length >= MAX_REVERT_LINES_TOTAL) {
+    return out.slice(0, MAX_REVERT_LINES_TOTAL);
+  }
 
   sourceBundle.files.forEach((file) => {
-    extractFunctionBlocks(file, methodBaseName).forEach((block) => {
-      const blockLines = block.content.split('\n');
-      blockLines.forEach((line, index) => {
-        const absoluteLine = block.startLine + index;
-        const trimmed = line.trim();
-        REVERT_CUSTOM_ERROR.lastIndex = 0;
-        let revertMatch: RegExpExecArray | null;
-        while ((revertMatch = REVERT_CUSTOM_ERROR.exec(trimmed)) !== null) {
-          const errorName = revertMatch[1];
-          const declaration = declaredByName.get(errorName);
-          if (declaration && declaration.selector === normalizedSelector) {
-            matches.push({
-              label: `${block.path}:${absoluteLine} - ${trimmed} [${declaration.signature} → ${normalizedSelector}]`,
-              line: absoluteLine
-            });
-          }
+    const lines = file.content.split('\n');
+    lines.forEach((line, index) => {
+      if (out.length >= MAX_REVERT_LINES_TOTAL) return;
+      const lineNum = index + 1;
+      const trimmed = line.trim();
+      if (!trimmed.includes('revert')) return;
+
+      REVERT_CUSTOM_ERROR.lastIndex = 0;
+      let revertMatch: RegExpExecArray | null;
+      while ((revertMatch = REVERT_CUSTOM_ERROR.exec(trimmed)) !== null) {
+        const errorName = revertMatch[1];
+        const declaration = declaredByName.get(errorName);
+        if (
+          declaration &&
+          declaration.selector.toLowerCase() === normalizedSelector.toLowerCase()
+        ) {
+          pushRevertMatchIfNew(
+            seen,
+            out,
+            file.path,
+            lineNum,
+            trimmed,
+            declaration.signature,
+            normalizedSelector,
+            methodBaseName ? '· elsewhere in bundle' : '· verified source'
+          );
         }
-      });
+      }
     });
   });
 
-  matches.sort((left, right) => left.line - right.line);
-  return [...new Map(matches.map((item) => [item.label, item.label])).values()].slice(0, 5);
+  return out.slice(0, MAX_REVERT_LINES_TOTAL);
 };
 
 export default function Home() {
@@ -988,9 +1064,9 @@ export default function Home() {
         );
         tx.sourceLocationStatus =
           tx.sourceLocationMatches.length > 0
-            ? 'Revert in transaction method matches RPC error selector (keccak4)'
+            ? 'Revert call sites in verified Etherscan sources (entry method first, then libraries / other files)'
             : decodeSourceBundle
-              ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${decodedError.selector}`
+              ? `No \`revert\` line for selector ${decodedError.selector} found in verified Solidity`
               : 'Verified source unavailable';
         tx.traceStatus = revertFetchMethod;
       };
