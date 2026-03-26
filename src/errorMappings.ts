@@ -5,7 +5,7 @@ export interface DecodedErrorResult {
   displayName: string;
   fullText: string;
   rawData: string;
-  source: 'standard' | 'preset' | 'abi' | 'unknown';
+  source: 'standard' | 'preset' | 'abi' | 'verified-source' | 'unknown';
 }
 
 const commonErrors: string[] = [
@@ -296,11 +296,24 @@ export const decodeError = (
     }
   }
 
+  return null;
+};
+
+/** Match a 4-byte custom error selector to declarations parsed from verified Solidity (e.g. `Errors.sol`). */
+export const matchDeclaredCustomError = (
+  errorSelector: string | null | undefined,
+  declarations: Array<{ selector: string; signature: string }>,
+  fullRevertHex: string
+): DecodedErrorResult | null => {
+  if (!errorSelector || !fullRevertHex.startsWith('0x')) return null;
+  const n = errorSelector.toLowerCase();
+  const hit = declarations.find((d) => d.selector.toLowerCase() === n);
+  if (!hit) return null;
   return {
-    selector: getErrorSelector(errorData) || '0x',
-    displayName: errorData.slice(0, 10),
-    fullText: errorData,
-    rawData: errorData,
-    source: 'unknown'
+    selector: n,
+    displayName: hit.signature,
+    fullText: hit.signature,
+    rawData: fullRevertHex,
+    source: 'verified-source'
   };
 };

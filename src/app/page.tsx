@@ -2,7 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ethers } from 'ethers';
-import { decodeError, getContractErrors, matchErrorSelector } from '../errorMappings';
+import type { DecodedErrorResult } from '../errorMappings';
+import {
+  decodeError,
+  getContractErrors,
+  matchDeclaredCustomError,
+  matchErrorSelector
+} from '../errorMappings';
 import {
   APP_CONFIG,
   AppChainConfig,
@@ -89,6 +95,28 @@ interface VerifiedSourceBundle {
   files: VerifiedSourceFile[];
 }
 
+/** Single contract row from Etherscan `getsourcecode` (result[0]). */
+type EtherscanContractSourceRow = Record<string, string | undefined>;
+
+/** When Etherscan marks a verified proxy, decode against the implementation contract. */
+function implementationAddressFromEtherscanRow(
+  row: EtherscanContractSourceRow | null
+): string | null {
+  if (!row) return null;
+  const proxyFlag = row.Proxy;
+  const isProxy =
+    proxyFlag === '1' ||
+    String(proxyFlag ?? '').toLowerCase() === 'true';
+  const raw = typeof row.Implementation === 'string' ? row.Implementation.trim() : '';
+  if (!isProxy || !raw) return null;
+  try {
+    if (!ethers.isAddress(raw)) return null;
+    return ethers.getAddress(raw);
+  } catch {
+    return null;
+  }
+}
+
 interface TraceCallFrame {
   type?: string;
   from?: string;
@@ -106,105 +134,13 @@ const getStorageKey = (
   type: 'transactions' | 'block' | 'pages'
 ) => `${chainId}_${contractId}_${type}`;
 
-const HEX_PATTERN = /0x[a-fA-F0-9]{8,}/g;
-const ADDRESS_HEX_LENGTH = 42;
 const SELECTOR_HEX_LENGTH = 10;
-const REVERT_DATA_FIELD_NAMES = new Set([
-  'data',
-  'errordata',
-  'revertdata',
-  'result',
-  'output',
-  'returndata',
-  'payload',
-  'body'
-]);
 
 const normalizeHexCandidate = (value: string): string | null => {
   const normalized = value.toLowerCase();
   if (!normalized.startsWith('0x')) return null;
   if (!/^0x[a-f0-9]+$/.test(normalized)) return null;
   return normalized;
-};
-
-const isLikelyAddress = (value: string): boolean => value.length === ADDRESS_HEX_LENGTH;
-
-const collectHexStrings = (
-  value: unknown,
-  acc: Array<{ value: string; path: string }>,
-  path = 'root',
-  seen = new WeakSet<object>()
-) => {
-  if (typeof value === 'string') {
-    const matches = value.match(HEX_PATTERN);
-    if (matches) {
-      matches.forEach((match) => {
-        const normalized = normalizeHexCandidate(match);
-        if (normalized) acc.push({ value: normalized, path });
-      });
-    }
-    return;
-  }
-
-  if (!value || typeof value !== 'object') return;
-  if (seen.has(value)) return;
-  seen.add(value);
-
-  if (Array.isArray(value)) {
-    value.forEach((item, index) => collectHexStrings(item, acc, `${path}[${index}]`, seen));
-    return;
-  }
-
-  Object.entries(value).forEach(([key, item]) => {
-    collectHexStrings(item, acc, `${path}.${key.toLowerCase()}`, seen);
-  });
-};
-
-const scoreHexCandidate = (candidate: { value: string; path: string }): number => {
-  let score = 0;
-  const pathParts = candidate.path.split('.');
-  const pathLower = candidate.path.toLowerCase();
-
-  if (candidate.value.length > ADDRESS_HEX_LENGTH) score += 20;
-  if (candidate.value.length === SELECTOR_HEX_LENGTH) score += 5;
-  if (isLikelyAddress(candidate.value)) score -= 30;
-
-  if (pathParts.some((part) => REVERT_DATA_FIELD_NAMES.has(part))) score += 50;
-  if (candidate.path.includes('error')) score += 15;
-  if (candidate.path.includes('message')) score -= 10;
-
-  // eth_call calldata lives here — first 4 bytes look like an "error" but are the function selector
-  if (pathLower.includes('transaction') && pathLower.includes('data')) score -= 120;
-  if (pathLower.endsWith('.input') || pathLower.includes('.input.')) score -= 120;
-  if (pathLower.includes('params[0]') && pathLower.includes('data')) score -= 120;
-
-  return score;
-};
-
-const extractHexCandidates = (error: unknown): string[] => {
-  const candidates: Array<{ value: string; path: string }> = [];
-  collectHexStrings(error, candidates);
-
-  return [...new Map(
-    candidates
-      .sort((left, right) => scoreHexCandidate(right) - scoreHexCandidate(left))
-      .map((candidate) => [candidate.value, candidate.value])
-  ).values()];
-};
-
-const extractErrorData = (error: unknown): string | null => {
-  const candidates = extractHexCandidates(error);
-  return candidates.find(
-    (candidate) => candidate.length > SELECTOR_HEX_LENGTH && !isLikelyAddress(candidate)
-  ) || null;
-};
-
-const extractErrorSelector = (error: unknown): string | null => {
-  const candidates = extractHexCandidates(error);
-  return candidates
-    .filter((candidate) => !isLikelyAddress(candidate))
-    .map((candidate) => candidate.slice(0, SELECTOR_HEX_LENGTH))
-    .find((candidate) => candidate.length === SELECTOR_HEX_LENGTH) || null;
 };
 
 const normalizeCalldataLower = (value: string | undefined | null): string => {
@@ -446,42 +382,78 @@ const extractDeclaredErrors = (sourceBundle: VerifiedSourceBundle | null): Array
 }> => {
   if (!sourceBundle) return [];
 
-  const declarations: Array<{
-    name: string;
-    signature: string;
-    selector: string;
-    declaration: string;
-    path: string;
-    line: number;
-  }> = [];
+  const bySelector = new Map<
+    string,
+    {
+      name: string;
+      signature: string;
+      selector: string;
+      declaration: string;
+      path: string;
+      line: number;
+    }
+  >();
 
-  sourceBundle.files.forEach((file) => {
-    const lines = file.content.split('\n');
-    lines.forEach((line, index) => {
-      const match = line.match(/\berror\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)\s*;/);
-      if (!match) return;
+  const errorDeclRe = /\berror\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*;/g;
 
+  for (const file of sourceBundle.files) {
+    const content = file.content;
+    let match: RegExpExecArray | null;
+    errorDeclRe.lastIndex = 0;
+    while ((match = errorDeclRe.exec(content)) !== null) {
       const name = match[1];
-      const params = match[2]
+      const paramsBody = match[2];
+      const params = paramsBody
         .split(',')
         .map((param) => param.trim())
         .filter(Boolean)
-        .map((param) => param.split(/\s+/)[0]);
+        .map((param) => param.split(/\s+/)[0] ?? '');
       const signature = `${name}(${params.join(',')})`;
+      const selector = ethers.id(signature).slice(0, 10).toLowerCase();
+      if (bySelector.has(selector)) continue;
 
-      declarations.push({
+      const line = content.slice(0, match.index ?? 0).split('\n').length;
+      const declaration = match[0].trim();
+
+      bySelector.set(selector, {
         name,
         signature,
-        selector: ethers.id(signature).slice(0, 10).toLowerCase(),
-        declaration: line.trim(),
+        selector,
+        declaration,
         path: file.path,
-        line: index + 1
+        line
       });
-    });
-  });
+    }
+  }
 
-  return declarations;
+  return [...bySelector.values()];
 };
+
+function logContractDeclaredErrorsToConsole(
+  chain: AppChainConfig,
+  requestedAddress: string,
+  bundle: VerifiedSourceBundle,
+  options?: { implementationAddress?: string | null; source?: 'fetched' | 'cached' }
+): void {
+  const declared = extractDeclaredErrors(bundle);
+  const impl = options?.implementationAddress;
+  const source = options?.source ?? 'fetched';
+  const title =
+    `[sc-debugger] Parsed custom errors (${declared.length}) — ${source} — ${chain.name} · ${requestedAddress}` +
+    (impl && impl.toLowerCase() !== requestedAddress.toLowerCase() ? ` → impl ${impl}` : '');
+
+  if (declared.length === 0) {
+    console.info(`${title}\n  (no \`error Name(...);\` declarations found in verified sources)`);
+    return;
+  }
+
+  console.groupCollapsed(title);
+  const sorted = [...declared].sort((a, b) => a.signature.localeCompare(b.signature));
+  for (const d of sorted) {
+    console.log(`${d.selector}  ${d.signature}`);
+  }
+  console.groupEnd();
+}
 
 /** Revert with a custom error: optional Library. prefix before the error name. */
 const REVERT_CUSTOM_ERROR =
@@ -549,6 +521,8 @@ export default function Home() {
   const [currentPage, setCurrentPage] = useState(1);
   const [storedDataSummary, setStoredDataSummary] = useState<StoredData>({});
   const [selectedErrorFilter, setSelectedErrorFilter] = useState('all');
+  /** Bumps after analysis loads verified source so the error dropdown re-reads `sourceBundleCacheRef`. */
+  const [sourceBundleVersion, setSourceBundleVersion] = useState(0);
   const [config, setConfig] = useState<ConfigData | null>(null);
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
   const [configValid, setConfigValid] = useState(false);
@@ -559,6 +533,7 @@ export default function Home() {
   const configRef = useRef<ConfigData | null>(null);
   const sourceBundleCacheRef = useRef<Record<string, VerifiedSourceBundle | null>>({});
   const abiCacheRef = useRef<Record<string, string | null>>({});
+  const etherscanContractRowCacheRef = useRef<Record<string, EtherscanContractSourceRow | null>>({});
 
   useEffect(() => {
     configRef.current = config;
@@ -766,6 +741,42 @@ export default function Home() {
     });
   };
 
+  const fetchEtherscanContractRow = async (
+    chain: AppChainConfig,
+    address: string
+  ): Promise<EtherscanContractSourceRow | null> => {
+    const cacheKey = `${chain.id}:${address.toLowerCase()}`;
+    if (Object.prototype.hasOwnProperty.call(etherscanContractRowCacheRef.current, cacheKey)) {
+      return etherscanContractRowCacheRef.current[cacheKey];
+    }
+
+    if (!configRef.current?.etherscanApiKey) {
+      etherscanContractRowCacheRef.current[cacheKey] = null;
+      return null;
+    }
+
+    try {
+      const url =
+        `${ETHERSCAN_API_V2_URL}?chainid=${chain.chainId}` +
+        `&module=contract&action=getsourcecode&address=${address}` +
+        `&apikey=${configRef.current.etherscanApiKey}`;
+      const response = await fetch(url);
+      const data = await response.json();
+      const result = Array.isArray(data.result) ? data.result[0] : null;
+      if (!result || typeof result !== 'object') {
+        etherscanContractRowCacheRef.current[cacheKey] = null;
+        return null;
+      }
+      const row = result as EtherscanContractSourceRow;
+      etherscanContractRowCacheRef.current[cacheKey] = row;
+      return row;
+    } catch (err) {
+      console.warn(`Unable to fetch contract metadata (getsourcecode) for ${address}:`, err);
+      etherscanContractRowCacheRef.current[cacheKey] = null;
+      return null;
+    }
+  };
+
   const fetchContractAbi = async (
     chain: AppChainConfig,
     contract: TrackedContractConfig
@@ -783,30 +794,47 @@ export default function Home() {
       return abiCacheRef.current[cacheKey];
     }
 
-    if (trackedContract?.abi) {
-      abiCacheRef.current[cacheKey] = trackedContract.abi;
-      return trackedContract.abi;
-    }
+    const addressMatchesTracked =
+      trackedContract &&
+      trackedContract.address.toLowerCase() === address.toLowerCase();
 
     if (!configRef.current?.etherscanApiKey) {
+      if (addressMatchesTracked && trackedContract.abi) {
+        abiCacheRef.current[cacheKey] = trackedContract.abi;
+        return trackedContract.abi;
+      }
       abiCacheRef.current[cacheKey] = null;
       return null;
     }
 
     try {
-      const url = `${ETHERSCAN_API_V2_URL}?chainid=${chain.chainId}&module=contract&action=getabi&address=${address}&apikey=${configRef.current.etherscanApiKey}`;
+      const row = await fetchEtherscanContractRow(chain, address);
+      const impl = implementationAddressFromEtherscanRow(row);
+      const abiTarget = impl ?? address;
+
+      if (!impl && addressMatchesTracked && trackedContract.abi) {
+        abiCacheRef.current[cacheKey] = trackedContract.abi;
+        return trackedContract.abi;
+      }
+
+      const url = `${ETHERSCAN_API_V2_URL}?chainid=${chain.chainId}&module=contract&action=getabi&address=${abiTarget}&apikey=${configRef.current.etherscanApiKey}`;
       const response = await fetch(url);
       const data = await response.json();
 
       if (data.status === '1' && typeof data.result === 'string' && data.result.startsWith('[')) {
         abiCacheRef.current[cacheKey] = data.result;
-        if (trackedContract && trackedContract.address.toLowerCase() === address.toLowerCase()) {
+        if (addressMatchesTracked) {
           persistContractAbi(chain.id, trackedContract.id, data.result);
         }
         return data.result;
       }
     } catch (err) {
       console.warn(`Unable to fetch ABI for ${address}:`, err);
+    }
+
+    if (addressMatchesTracked && trackedContract.abi) {
+      abiCacheRef.current[cacheKey] = trackedContract.abi;
+      return trackedContract.abi;
     }
 
     abiCacheRef.current[cacheKey] = null;
@@ -827,7 +855,16 @@ export default function Home() {
   ): Promise<VerifiedSourceBundle | null> => {
     const cacheKey = `${chain.id}:${address.toLowerCase()}`;
     if (cacheKey in sourceBundleCacheRef.current) {
-      return sourceBundleCacheRef.current[cacheKey];
+      const cached = sourceBundleCacheRef.current[cacheKey];
+      if (cached) {
+        const row = await fetchEtherscanContractRow(chain, address);
+        const impl = implementationAddressFromEtherscanRow(row);
+        logContractDeclaredErrorsToConsole(chain, address, cached, {
+          implementationAddress: impl ?? undefined,
+          source: 'cached'
+        });
+      }
+      return cached;
     }
 
     if (!configRef.current?.etherscanApiKey) {
@@ -836,24 +873,32 @@ export default function Home() {
     }
 
     try {
-      const url =
-        `${ETHERSCAN_API_V2_URL}?chainid=${chain.chainId}` +
-        `&module=contract&action=getsourcecode&address=${address}` +
-        `&apikey=${configRef.current.etherscanApiKey}`;
-      const response = await fetch(url);
-      const data = await response.json();
-      const result = Array.isArray(data.result) ? data.result[0] : null;
+      const row = await fetchEtherscanContractRow(chain, address);
+      const impl = implementationAddressFromEtherscanRow(row);
 
-      if (!result || typeof result.SourceCode !== 'string') {
+      let sourceRow = row;
+      if (impl && impl.toLowerCase() !== address.toLowerCase()) {
+        sourceRow = await fetchEtherscanContractRow(chain, impl);
+      }
+
+      if (!sourceRow || typeof sourceRow.SourceCode !== 'string') {
         sourceBundleCacheRef.current[cacheKey] = null;
         return null;
       }
 
       const bundle = parseVerifiedSourceCode(
-        result.SourceCode,
-        typeof result.ContractName === 'string' ? result.ContractName : fallbackName
+        sourceRow.SourceCode,
+        typeof sourceRow.ContractName === 'string' ? sourceRow.ContractName : fallbackName
       );
+      if (!bundle) {
+        sourceBundleCacheRef.current[cacheKey] = null;
+        return null;
+      }
       sourceBundleCacheRef.current[cacheKey] = bundle;
+      logContractDeclaredErrorsToConsole(chain, address, bundle, {
+        implementationAddress: impl ?? undefined,
+        source: 'fetched'
+      });
       return bundle;
     } catch (err) {
       console.warn(`Unable to fetch source code for ${address}:`, err);
@@ -872,67 +917,80 @@ export default function Home() {
     const provider = new ethers.JsonRpcProvider(chain.rpcUrl);
     const abi = await fetchContractAbi(chain, contract);
     const sourceBundle = await fetchContractSourceBundle(chain, contract);
+    const proxyRow = await fetchEtherscanContractRow(chain, contract.address);
+    const implAddress = implementationAddressFromEtherscanRow(proxyRow);
+    const decodeAddress = implAddress ?? contract.address;
+    const declaredErrorsFromSource = extractDeclaredErrors(sourceBundle);
+    const declaredErrorsForMatching = declaredErrorsFromSource.map((d) => ({
+      selector: d.selector,
+      signature: d.signature
+    }));
 
     for (let i = 0; i < failedTxs.length; i += 1) {
       const tx = failedTxs[i];
       const progressPercent = Math.round(((i + 1) / failedTxs.length) * 100);
       setCurrentProgress(`Analyzing error details... ${i + 1}/${failedTxs.length} (${progressPercent}%)`);
-      let decodeAddress = contract.address;
-      let decodeAbi = abi;
-      let decodeSourceBundle = sourceBundle;
+      const decodeAbi = abi;
+      const decodeSourceBundle = sourceBundle;
 
       const applyRevertToTx = (
         resolvedErrorData: string,
         revertFetchMethod: string
       ) => {
         const errorSelector = selectorFromRevertHex(resolvedErrorData);
-        const decodedError =
-          decodeError(resolvedErrorData, decodeAddress, decodeAbi) ||
-          (errorSelector ? matchErrorSelector(errorSelector, decodeAddress, decodeAbi) : null);
+
+        let decodedError: DecodedErrorResult | null = decodeError(
+          resolvedErrorData,
+          decodeAddress,
+          decodeAbi
+        );
+
+        if (!decodedError && errorSelector) {
+          decodedError = matchErrorSelector(errorSelector, decodeAddress, decodeAbi);
+        }
+
+        if (!decodedError && errorSelector && declaredErrorsForMatching.length > 0) {
+          decodedError = matchDeclaredCustomError(
+            errorSelector,
+            declaredErrorsForMatching,
+            resolvedErrorData
+          );
+        }
+
+        if (!decodedError) {
+          decodedError = {
+            selector: errorSelector || resolvedErrorData.slice(0, 10).toLowerCase(),
+            displayName: resolvedErrorData.slice(0, 10),
+            fullText: resolvedErrorData,
+            rawData: resolvedErrorData,
+            source: 'unknown'
+          };
+        }
 
         tx.revertFetchMethod = revertFetchMethod;
         tx.errorProbeSource = revertFetchMethod;
 
-        if (decodedError) {
-          tx.errorName = decodedError.displayName;
-          tx.errorReason = decodedError.fullText;
-          tx.errorDataRaw = decodedError.rawData;
-          tx.errorSelector = decodedError.selector;
-          tx.decodedErrorSignature = decodedError.displayName;
-          tx.errorDecodeStatus =
-            decodedError.rawData.length > 10
+        tx.errorName = decodedError.displayName;
+        tx.errorReason = decodedError.fullText;
+        tx.errorDataRaw = decodedError.rawData;
+        tx.errorSelector = decodedError.selector;
+        tx.decodedErrorSignature = decodedError.displayName;
+        tx.errorDecodeStatus =
+          decodedError.source === 'unknown'
+            ? 'Selector not mapped to a name (check ABI / verified Solidity)'
+            : decodedError.rawData.length > 10
               ? `Decoded from full revert data (${decodedError.source})`
               : `Matched by selector only (${decodedError.source})`;
-          tx.sourceLocationMatches = findRevertLinesMatchingSelector(
-            decodeSourceBundle,
-            tx.functionName,
-            decodedError.selector
-          );
-          tx.sourceLocationStatus =
-            tx.sourceLocationMatches.length > 0
-              ? 'Revert in transaction method matches RPC error selector (keccak4)'
-              : decodeSourceBundle
-                ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${decodedError.selector}`
-                : 'Verified source unavailable';
-          tx.traceStatus = revertFetchMethod;
-          return;
-        }
-
-        tx.errorReason = resolvedErrorData;
-        tx.errorName = 'UNKNOWN_ERROR';
-        tx.errorSelector = errorSelector || undefined;
-        tx.errorDataRaw = resolvedErrorData;
-        tx.errorDecodeStatus = 'RPC returned hex but decode failed';
         tx.sourceLocationMatches = findRevertLinesMatchingSelector(
           decodeSourceBundle,
           tx.functionName,
-          tx.errorSelector
+          decodedError.selector
         );
         tx.sourceLocationStatus =
           tx.sourceLocationMatches.length > 0
             ? 'Revert in transaction method matches RPC error selector (keccak4)'
             : decodeSourceBundle
-              ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${tx.errorSelector || 'none'}`
+              ? `No revert in "${getMethodBaseName(tx.functionName) || 'method'}" matches selector ${decodedError.selector}`
               : 'Verified source unavailable';
         tx.traceStatus = revertFetchMethod;
       };
@@ -1107,6 +1165,8 @@ export default function Home() {
         await new Promise((resolve) => setTimeout(resolve, APP_CONFIG.RPC_DELAY_MS));
       }
     }
+
+    setSourceBundleVersion((v) => v + 1);
   };
 
   const fetchTransactions = async (fetchType: boolean | 'latest') => {
@@ -1405,9 +1465,26 @@ export default function Home() {
     return match ? match[1].trim() : functionName;
   };
 
-  const availableErrors = currentContractConfig
-    ? getContractErrors(currentContractConfig.address, currentContractConfig.abi)
-    : [];
+  const availableErrors = useMemo(() => {
+    void sourceBundleVersion;
+    if (!currentContractConfig || !currentChainConfig) return [];
+    const cacheKey = `${currentChainConfig.id}:${currentContractConfig.address.toLowerCase()}`;
+    const bundle = sourceBundleCacheRef.current[cacheKey];
+    const abiList = getContractErrors(currentContractConfig.address, currentContractConfig.abi);
+    const fromVerifiedSource = bundle
+      ? extractDeclaredErrors(bundle).map((d) => d.signature)
+      : [];
+    const seen = new Set(abiList.map((s) => s.replace(/\s/g, '').toLowerCase()));
+    const merged = [...abiList];
+    for (const sig of fromVerifiedSource) {
+      const k = sig.replace(/\s/g, '').toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        merged.push(sig);
+      }
+    }
+    return merged;
+  }, [currentChainConfig, currentContractConfig, sourceBundleVersion]);
 
   const filteredTransactions = selectedErrorFilter === 'all'
     ? failedTransactions
