@@ -43,7 +43,6 @@ interface Transaction {
   decodedErrorSignature?: string;
   errorDecodeStatus?: string;
   errorProbeSource?: string;
-  errorDebugRaw?: string;
   sourceLocationStatus?: string;
   sourceLocationMatches?: string[];
   traceStatus?: string;
@@ -354,25 +353,6 @@ const buildTraceSummary = (frame: TraceCallFrame | null | undefined): string[] =
   }
 
   return summary.slice(0, 5);
-};
-
-const safeStringifyError = (error: unknown): string => {
-  try {
-    const seen = new WeakSet<object>();
-    return JSON.stringify(
-      error,
-      (_, value) => {
-        if (typeof value === 'bigint') return value.toString();
-        if (!value || typeof value !== 'object') return value;
-        if (seen.has(value)) return '[Circular]';
-        seen.add(value);
-        return value;
-      },
-      2
-    );
-  } catch {
-    return String(error);
-  }
 };
 
 /** Thrown value may be null, a string, an Error, or a trace frame — never assume `.code` exists. */
@@ -1185,7 +1165,6 @@ export default function Home() {
               ? `Decoded from full revert data (${decodedError.source})`
               : `Matched by selector only (${decodedError.source})`) + latestRevertHint;
           tx.errorProbeSource = resolvedProbe || 'unknown';
-          tx.errorDebugRaw = safeStringifyError(callError);
           tx.sourceLocationMatches = findRevertLinesMatchingSelector(
             decodeSourceBundle,
             tx.functionName,
@@ -1216,7 +1195,6 @@ export default function Home() {
                 ? 'RPC returned selector only'
                 : 'RPC returned reason text only') + latestRevertHint;
           tx.errorProbeSource = resolvedProbe || 'unknown';
-          tx.errorDebugRaw = safeStringifyError(callError);
           tx.sourceLocationMatches = findRevertLinesMatchingSelector(
             decodeSourceBundle,
             tx.functionName,
@@ -1245,7 +1223,6 @@ export default function Home() {
             ? 'RPC returned selector only' + latestRevertHint
             : 'No revert hex from RPC. Use an archive JSON-RPC URL with full historical state, or decode the failure on the block explorer / simulation API (e.g. Tenderly).';
         tx.errorProbeSource = resolvedProbe || 'unknown';
-        tx.errorDebugRaw = safeStringifyError(callError);
         tx.sourceLocationMatches = findRevertLinesMatchingSelector(
           decodeSourceBundle,
           tx.functionName,
@@ -2030,27 +2007,27 @@ export default function Home() {
                           <div className="font-semibold text-red-800">
                             {tx.errorName || 'Unknown'}
                           </div>
-                          <div className="mt-1 text-xs text-gray-700">
-                            Status: {tx.errorDecodeStatus || 'Not analyzed yet'}
-                          </div>
-                          <div className="mt-1 text-xs text-gray-700">
-                            Probe: {tx.errorProbeSource || 'unknown'}
-                          </div>
                           <div className="mt-1 font-mono text-xs text-gray-600">
                             Selector: {tx.errorSelector || 'not returned'}
                           </div>
-                          <div className="mt-1 font-mono text-xs text-gray-600">
-                            Hex: {tx.errorDataRaw || 'not returned by RPC'}
-                          </div>
-                          <div className="mt-1 whitespace-pre-wrap break-words text-gray-800">
-                            {tx.errorReason || 'Unknown error'}
-                          </div>
-                          <div className="mt-2 text-xs text-gray-700">
-                            Source: {tx.sourceLocationStatus || 'Not checked yet'}
-                          </div>
-                          <div className="mt-1 text-xs text-gray-700">
-                            Trace: {tx.traceStatus || 'Not checked yet'}
-                          </div>
+                          {(() => {
+                            const reason = (tx.errorReason || '').trim();
+                            const title = (tx.errorName || '').trim();
+                            const sig = (tx.decodedErrorSignature || '').trim();
+                            if (reason && reason !== title && reason !== sig) {
+                              return (
+                                <div className="mt-1 whitespace-pre-wrap break-words text-gray-800">
+                                  {tx.errorReason}
+                                </div>
+                              );
+                            }
+                            if (!reason && (!title || title === 'Unknown')) {
+                              return (
+                                <div className="mt-1 text-sm text-gray-600">Unknown error</div>
+                              );
+                            }
+                            return null;
+                          })()}
                           {tx.traceSummary && tx.traceSummary.length > 0 && (
                             <div className="mt-1 rounded bg-slate-50 p-2 text-xs text-gray-700">
                               {tx.traceSummary.map((item) => (
@@ -2068,16 +2045,6 @@ export default function Home() {
                                 </div>
                               ))}
                             </div>
-                          )}
-                          {tx.errorDebugRaw && (
-                            <details className="mt-2">
-                              <summary className="cursor-pointer text-xs text-gray-600">
-                                Raw RPC error payload
-                              </summary>
-                              <pre className="mt-1 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-xs text-gray-600">
-                                {tx.errorDebugRaw}
-                              </pre>
-                            </details>
                           )}
                         </td>
                         <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-900">
