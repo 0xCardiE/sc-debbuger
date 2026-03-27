@@ -156,6 +156,8 @@ export const PRESET_TRACKED_CONTRACTS: Record<string, TrackedContractConfig[]> =
 
 export const APP_CONFIG = {
   MAX_FAILED_TRANSACTIONS: 2000,
+  /** First "Fetch failed transactions" stops after this many failures (before dedupe / analyze). */
+  INITIAL_FAILED_TRANSACTIONS_TO_LOAD: 100,
   TRANSACTIONS_PER_PAGE: 50,
   API_PAGE_SIZE: 10000,
   API_MAX_WINDOW: 10000,

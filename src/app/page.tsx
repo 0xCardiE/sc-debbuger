@@ -1340,8 +1340,8 @@ export default function Home() {
           allFailedTxs = [...allFailedTxs, ...convertedTxs];
         }
 
-        if (isInitialFetch && allFailedTxs.length >= 5) {
-          allFailedTxs = allFailedTxs.slice(0, 5);
+        if (isInitialFetch && allFailedTxs.length >= APP_CONFIG.INITIAL_FAILED_TRANSACTIONS_TO_LOAD) {
+          allFailedTxs = allFailedTxs.slice(0, APP_CONFIG.INITIAL_FAILED_TRANSACTIONS_TO_LOAD);
           hasMore = false;
           break;
         }
